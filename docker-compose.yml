@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  ca:
+    build:
+      context: ./ca
+    container_name: ca_p2dpi
+    volumes:
+      - ./ca/certs:/ca/certs
+      - ./ca/private:/ca/private
+      - ./ca/newcerts:/ca/newcerts
+      - ./ca/csr:/ca/csr
+      - ./ca/crl:/ca/crl
+    restart: unless-stopped
