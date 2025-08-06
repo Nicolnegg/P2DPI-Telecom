@@ -4,66 +4,29 @@
 # verify their signature, compute intermediate rules, and forward to MB.
 
 from flask import Flask, request, jsonify
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
-from cryptography.fernet import Fernet
-from ctypes import CDLL, c_char_p, c_int, create_string_buffer
-import os, base64, requests
+from ctypes import c_char_p, create_string_buffer
+from receiver_utils import (
+    load_prf_library,
+    load_h_fixed,
+    load_ksr,
+    load_public_key,
+    verify_signature
+)
+
+import requests
+import os
 
 # Flask HTTP app instance
 app = Flask("receiver_http")
 
-# === Load PRF shared library ===
-current_dir = os.path.dirname(os.path.abspath(__file__))
-prf_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'prf.so'))
-prf = CDLL(prf_path)
-prf.FKH_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
-prf.FKH_hex.restype = c_int
+# === Load PRF shared library, h_fixed, public key, and kSR ===
+prf = load_prf_library()
+h_fixed_hex = load_h_fixed()
 
-# === Load RG public key ===
-def load_public_key(path: str):
-    with open(path, 'rb') as f:
-        return serialization.load_pem_public_key(f.read(), backend=default_backend())
-
-public_key_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'keys', 'rg_public_key.pem'))
+# Load RG public key
+current_dir = __file__
+public_key_path = os.path.abspath(os.path.join(os.path.dirname(current_dir), '..', 'shared', 'keys', 'rg_public_key.pem'))
 rg_public_key = load_public_key(public_key_path)
-
-# === Load encrypted kSR from disk ===
-def load_ksr():
-    base_dir = os.path.join(current_dir, 'keys')
-    ksr_path = os.path.join(base_dir, "shared_ksr.key")
-    key_path = os.path.join(base_dir, "key_for_ksr.key")
-
-    if not os.path.exists(ksr_path) or not os.path.exists(key_path):
-        raise ValueError("Missing kSR or encryption key")
-
-    with open(key_path, "rb") as f:
-        key = f.read()
-    cipher_suite = Fernet(key)
-
-    with open(ksr_path, "rb") as f:
-        encrypted_ksr = f.read()
-
-    return cipher_suite.decrypt(encrypted_ksr).decode()
-
-# === Verify RSA-PSS signature ===
-def verify_signature(data: str, signature_b64: str, public_key) -> bool:
-    try:
-        signature = base64.b64decode(signature_b64)
-        public_key.verify(
-            signature,
-            data.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return True
-    except (InvalidSignature, ValueError):
-        return False
 
 # === Receive detection rules, verify, compute I_i, and send to MB ===
 @app.route('/receive_rules', methods=['POST'])
@@ -74,6 +37,7 @@ def receive_rules():
 
     print(f"[Receiver] Received {len(data)} rules.")
 
+    # Signature verification
     for entry in data:
         Ri = entry.get("obfuscated")
         sig = entry.get("signature")
@@ -83,18 +47,25 @@ def receive_rules():
             return jsonify({"error": "Signature verification failed"}), 400
     print("[Receiver] All signatures verified.")
 
+    # Load shared key kSR
     try:
         kSR = load_ksr()
     except Exception as e:
         print(f"[Receiver] Failed to load kSR: {e}")
         return jsonify({"error": "Failed to load kSR"}), 500
 
+    # Compute intermediate rules
     output_buffer = create_string_buffer(200)
     intermediate_rules = []
-
     for entry in data:
         Ri = entry["obfuscated"]
-        res = prf.EC_POINT_exp_hex(Ri.encode(), kSR.encode(), output_buffer, 200)
+        res = prf.FKH_hex(
+            c_char_p(Ri.encode()),
+            c_char_p(kSR.encode()),
+            c_char_p(h_fixed_hex.encode()),
+            output_buffer,
+            200
+        )
         if res != 1:
             return jsonify({"error": f"FKH failed for rule: {Ri}"}), 500
         Ii = output_buffer.value.decode()
@@ -102,6 +73,7 @@ def receive_rules():
 
     print("[Receiver] Computed all intermediate rules.")
 
+    # Send to Middlebox
     mb_url = "http://localhost:9999/receive_intermediate"
     try:
         response = requests.post(mb_url, json={"receiver_intermediate": intermediate_rules})

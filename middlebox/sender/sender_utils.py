@@ -4,9 +4,9 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
-from ctypes import CDLL, c_char_p, c_int, create_string_buffer
+from ctypes import CDLL, c_char_p, c_int, create_string_buffer, c_ubyte, POINTER
 
-
+import struct
 import os
 import base64
 import logging
@@ -19,9 +19,20 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 prf_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'prf.so'))
 prf = CDLL(prf_path)
 
-prf.FKH_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
+prf.FKH_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_char_p, c_int]
 prf.FKH_hex.restype = c_int
 
+# Load H2 from the shared library
+prf.H2.argtypes = [POINTER(c_ubyte), c_int, POINTER(c_ubyte), POINTER(c_ubyte)]
+prf.H2.restype = c_int
+
+# === Load fixed session point h from file ===
+h_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'h_fixed.txt'))
+with open(h_path, 'r') as f:
+    h_fixed_hex = f.read().strip()
+
+# === Path to stored kSR key file ===
+ksr_path = os.path.abspath(os.path.join(current_dir, "keys", "shared_ksr.key"))
 
 
 def extract_tokens_sliding_window(payload: bytes, window_size=TOKEN_WINDOW_SIZE):
@@ -40,40 +51,53 @@ def extract_tokens_sliding_window(payload: bytes, window_size=TOKEN_WINDOW_SIZE)
     return [payload[i:i+window_size] for i in range(len(payload) - window_size + 1)]
 
 
+
 def encrypt_tokens(tokens, kSR_hex, counter):
     """
-    Encrypts each token using the P2DPI encryption scheme.
-
-    For each token t_i, it computes:
-        T_i = H2(counter + i, (g^{H1(t_i)} h)^{kSR})
-
-    Here, the cryptographic operation is done by calling
-    the external C library function 'FKH_hex' via ctypes.
-
-    Args:
-        tokens (List[bytes]): List of token byte strings extracted from the traffic.
-        kSR_hex (str): The session key 'kSR' as a hex string.
-        counter (int): A random counter used to avoid pattern leakage.
-
-    Returns:
-        List[str]: List of encrypted token hex strings T_i.
+    Encrypt tokens as Ti = H2(c + i, (g^{H1(ti)} h)^{kSR}).
+    Returns list of encrypted token bytes.
     """
     encrypted_tokens = []
-    output_buffer = create_string_buffer(BUFFER_SIZE)  # buffer to receive output from C function
 
     for i, token_bytes in enumerate(tokens):
-        # Convert token bytes to uppercase hex string for the C function
+        # Compute (g^{H1(ti)} * h)^{kSR} using FKH_hex
         token_hex = token_bytes.hex().upper()
 
-        # Call the C library function to perform the key-homomorphic encryption
-        # The C function signature:
-        # int FKH_hex(char* token_hex, char* kSR_hex, char* output, int out_len);
-        res = prf.FKH_hex(token_hex.encode(), kSR_hex.encode(), output_buffer, BUFFER_SIZE)
+        # Read EC point hex result from the last call's buffer (reuse buffer)
+        # Actually, better to store the output explicitly:
+        output_buffer_fk = create_string_buffer(BUFFER_SIZE)  # char* buffer
+        res = prf.FKH_hex(
+            c_char_p(token_hex.encode()),
+            c_char_p(kSR_hex.encode()),
+            c_char_p(h_fixed_hex.encode()),
+            output_buffer_fk,
+            BUFFER_SIZE
+        )
         if res != 1:
-            raise RuntimeError(f"Encryption failed for token {token_hex}")
+            raise RuntimeError(f"FKH_hex failed for token {token_hex}")
 
-        # Decode the output buffer value (encrypted token) as a UTF-8 string
-        encrypted_tokens.append(output_buffer.value.decode())
+        point_hex = output_buffer_fk.value.decode()
+
+        # Convert EC point hex to bytes, take first 16 bytes as AES key for H2
+        point_bytes = bytes.fromhex(point_hex)
+        if len(point_bytes) < 16:
+            raise RuntimeError(f"EC point bytes too short for token {token_hex}")
+        h2_key = (c_ubyte * 16).from_buffer_copy(point_bytes[:16])
+
+        # Prepare y = counter + i as 16-byte big endian
+        y_int = counter + i
+        # Pack into 16 bytes: upper 8 bytes zero, lower 8 bytes = y_int
+        y_bytes = struct.pack(">QQ", 0, y_int) # payload of 0 for achieve the 16 bytes
+        y_cbytes = (c_ubyte * 16).from_buffer_copy(y_bytes)
+
+        # Call H2(y_bytes, 16, h2_key, output_buffer)
+        output_h2 = (c_ubyte * 16)()
+        success = prf.H2(y_cbytes, 16, h2_key, output_h2)
+        if success != 1:
+            raise RuntimeError(f"H2 encryption failed for token {token_hex}")
+
+        # Append encrypted token bytes to result list
+        encrypted_tokens.append(bytes(output_h2))
 
     return encrypted_tokens
 
@@ -104,19 +128,30 @@ def verify_signature(data: str, signature_b64: str, public_key) -> bool:
         return False
 
 def compute_intermediate_rules_hex(rules_hex, kSR_hex):
+    """
+    Given a list of obfuscated rules (hex strings), compute the intermediate rules using FKH.
+    Args:
+        rules_hex (List[str]): Obfuscated rule values (hex-encoded strings).
+        kSR_hex (str): Session key shared between Sender and Receiver.
+    Returns:
+        List[str]: List of intermediate rule values.
+    """
     results = []
     output_buffer = create_string_buffer(BUFFER_SIZE)
     for r in rules_hex:
-        res = prf.FKH_hex(r.encode(), kSR_hex.encode(), output_buffer, BUFFER_SIZE)
+        res = prf.FKH_hex(
+            c_char_p(r.encode()),
+            c_char_p(kSR_hex.encode()),
+            c_char_p(h_fixed_hex.encode()),
+            output_buffer,
+            BUFFER_SIZE
+        )
         if res != 1:
             logging.error(f"FKH_hex failed for input: {r}")
             raise RuntimeError(f"FKH_hex failed for input: {r}")
         results.append(output_buffer.value.decode())
     return results
     
-# === Path to stored kSR key file ===
-ksr_path = os.path.abspath(os.path.join(current_dir, "keys", "shared_ksr.key"))
-
 def load_ksr_from_file():
     if not os.path.exists(ksr_path):
         raise FileNotFoundError(f"kSR key file not found: {ksr_path}")

@@ -1,13 +1,13 @@
 # middlebox/mb/mb_main.py
 from flask import Flask, request, jsonify
 import requests
-from sniffer import start_sniff
-import threading
-from ctypes import CDLL, c_char_p, c_int, create_string_buffer
+from ctypes import cast, CDLL, c_char_p, c_int, create_string_buffer, c_ubyte, POINTER
 import os
+import hashlib 
 
 
 app = Flask(__name__)
+
 
 RULES = []
 S_INTERMEDIATE = []
@@ -15,6 +15,9 @@ R_INTERMEDIATE = []
 SESSION_RULES = []
 kmb = None
 kmb_buf = None  # Keep a reference so GC doesn't free the buffer
+
+RECEIVER_URL = "https://receiver.p2dpi.local:10443/store_tokens" 
+CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
 
 
 # === Load PRF (FKH_inv_hex) ===
@@ -25,8 +28,25 @@ prf = CDLL(prf_path)
 prf.FKH_inv_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
 prf.FKH_inv_hex.restype = c_int
 
-prf.FKH_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
-prf.FKH_hex.restype = c_int
+# int H2(const unsigned char *y_bytes, int y_len, const unsigned char *h_key, unsigned char *output)
+prf.H2.argtypes = [
+    POINTER(c_ubyte),  # y_bytes (input 16 bytes)
+    c_int,             # y_len
+    POINTER(c_ubyte),  # h_key (16 bytes)
+    POINTER(c_ubyte),  # output (16 bytes)
+]
+prf.H2.restype = c_int
+
+def load_h_fixed():
+    global h_fixed
+    try:
+        shared_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared'))
+        h_path = os.path.join(shared_dir, 'h_fixed.txt')
+        with open(h_path, "r") as f:
+            h_fixed = f.read().strip()
+        print(f"[MB] Loaded fixed point h from {h_path}")
+    except Exception as e:
+        print("[MB] Failed to load h_fixed:", e)
 
 # Try loading existing key at startup
 def load_kmb_from_file():
@@ -47,6 +67,87 @@ def load_kmb_from_file():
         print("[MB] Error loading kMB key:", e)
 
 load_kmb_from_file()
+load_h_fixed()
+
+def h2_compute(counter_i, session_key_hex):
+    """
+    Compute H2((c+i), Sj) using the C function.
+    counter_i: integer c+i (32-bit int)
+    session_key_hex: full EC point Sj in hex (long hex string)
+    Returns: 16-byte AES-ECB encrypted output as hex string
+    """
+    # Prepare input y_bytes: 4 bytes big-endian + 12 zero bytes
+    y_bytes = counter_i.to_bytes(4, 'big') + b'\x00' * 12
+    y_buf = create_string_buffer(y_bytes, 16)
+
+    # Convert hex string point Sj to bytes
+    sj_bytes = bytes.fromhex(session_key_hex)
+
+    # Hash Sj bytes (e.g. SHA-256)
+    hash_sj = hashlib.sha256(sj_bytes).digest()
+
+    # Use first 16 bytes of hash as AES key
+    h_key_bytes = hash_sj[:16]
+
+    # Prepare h_key buffer
+    h_key_buf = create_string_buffer(h_key_bytes, 16)
+
+    # Output buffer (16 bytes)
+    output_buf = create_string_buffer(16)
+
+    # Call C H2 function
+    success = prf.H2(
+        cast(y_buf, POINTER(c_ubyte)),
+        16,
+        cast(h_key_buf, POINTER(c_ubyte)),
+        cast(output_buf, POINTER(c_ubyte))
+    )
+
+    if not success:
+        raise RuntimeError("H2 encryption failed")
+
+    return output_buf.raw.hex()
+
+def send_and_validate_tokens(tokens, counter_int):
+    """
+    Sends the encrypted tokens and counter to the Receiver (R) for validation.
+    This function is called from the Middlebox (MB) to verify whether the
+    traffic it observed is legitimate and authorized according to the session rules.
+
+    Parameters:
+        tokens (list of str): Encrypted tokens {Ti} in hexadecimal string format.
+        counter_int (int): The base counter value 'c' used to compute Ti = H2(c + i, ...)
+    """
+    # Convert counter to hex string (remove "0x" prefix)
+    counter_hex = hex(counter_int)[2:]
+
+    # Create JSON payload to send to the Receiver
+    payload = {
+        "tokens": tokens,     # Encrypted tokens as hex strings
+        "counter": counter_hex
+    }
+
+    try:
+        print("[MB ➜ R] Sending tokens to receiver for validation...")
+
+        # Send POST request to Receiver for validation (with TLS verification)
+        response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
+
+        # Log the response from Receiver
+        print(f"[MB ➜ R] Receiver response: {response.status_code} - {response.text}")
+
+        # Parse response: check if status is OK (tokens are valid)
+        if response.status_code == 200 and response.json().get("status") == "OK":
+            print("[MB] Tokens validated successfully by Receiver.")
+            return True
+        else:
+            print("[MB] ALERT: Traffic differs! Possible attack detected.")
+            return False
+
+    except Exception as e:
+        # Handle network, TLS, or parsing errors
+        print(f"[MB] Error sending tokens to Receiver: {e}")
+        return False
 
 # === Endpoint to receive and forward obfuscated rules ===
 @app.route("/upload_rules", methods=["POST"])
@@ -134,9 +235,7 @@ def receive_intermediate():
     for s in SESSION_RULES:
         print("  -", s)
 
-    # Opcional: enviar ahora las session rules a R y S si es parte del diseño
-
-    # Limpieza
+    # Clean
     S_INTERMEDIATE = []
     R_INTERMEDIATE = []
 
@@ -172,15 +271,78 @@ def receive_kmb():
     except Exception as e:
         print("[MB] Error in /receive_kmb:", e)
         return "Internal error", 500
-    
+
+# === Endpoint to receive encrypted tokens from Sender HTTPS ===
+@app.route("/receive_tokens", methods=["POST"])
+def receive_tokens():
+    data = request.get_json()
+    # Check if the request JSON contains both 'encrypted_tokens' and counter 'c'
+    if not data or "encrypted_tokens" not in data or "c" not in data:
+        return jsonify({"error": "Missing encrypted_tokens or counter c"}), 400
+
+    tokens = data["encrypted_tokens"]  # List of encrypted tokens in hex format
+    c_hex = data["c"]                  # Counter 'c' sent as hex string
+    counter = int(c_hex, 16)           # Convert counter from hex string to integer
+    print(f"[MB] Received {len(tokens)} encrypted tokens with counter c={counter}")
+
+    # Perform detection 
+    alert_raised = False
+
+    # SESSION_RULES already contains the list of session keys Sj in hex format
+    for i, Ti in enumerate(tokens):
+        for j, Sj in enumerate(SESSION_RULES):
+            # Compute H2(c + i, Sj) using the C function
+            h2_val = h2_compute(counter + i, Sj)
+            # Compare the computed H2 value with the received token (case-insensitive)
+            if h2_val.lower() == Ti.lower():
+                print(f"[ALERT] Match found! Token {i} matches H2(c+i, S{j})")
+                alert_raised = True
+
+    # Send tokens and counter to the Receiver to store them
+    payload = {
+        "tokens": tokens,
+        "counter": c_hex
+    }
+
+    try:
+        # Make a POST request to the Receiver's store_tokens endpoint
+        response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
+        print(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
+
+        if response.status_code != 200:
+            print(f"[MB] Critical error: Receiver responded with status {response.status_code}")
+            return jsonify({"error": "Failed to store tokens at Receiver"}), 500
+
+    except Exception as e:
+        print(f"[MB] Critical error sending tokens to Receiver: {e}")
+        return jsonify({"error": "Critical failure sending tokens to Receiver"}), 500
+
+    # Return alert if any match is detected, otherwise confirm no matches
+    if alert_raised:
+        return jsonify({"status": "alert"}), 200
+    else:
+        return jsonify({"status": "ok"}), 200
+
+# === Endpoint to receive alerts from Receiver indicating possible attack ===
+@app.route("/validation", methods=["POST"])
+def receive_alert_from_receiver():
+    """
+    Receives alert JSON from Receiver indicating possible attack or anomaly.
+    """
+    alert_data = request.get_json()
+
+    if not alert_data:
+        return jsonify({"error": "Missing alert data"}), 400
+
+    print("\n[MB] ⚠️ ALERT RECEIVED FROM RECEIVER ⚠️")
+    print("[MB] Details:", alert_data)
+
+    # Optional: log to file or trigger other detection mechanisms here
+
+    return jsonify({"status": "Alert received"}), 200
+
 
 if __name__ == "__main__":
-    # Start sniffer in background thread
-    sniff_thread = threading.Thread(target=start_sniff, kwargs={
-        "interface": "lo",
-        "bpf_filter": "tcp port 8080"
-    }, daemon=True)
-    sniff_thread.start()
-
     print("[MB] Starting Flask server on port 9999...")
-    app.run(port=9999)
+    app.run(host="0.0.0.0", port=9999)
+

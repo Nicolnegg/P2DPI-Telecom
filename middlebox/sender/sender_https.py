@@ -13,7 +13,7 @@ SENDER_CERT = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "certs", 
 SENDER_KEY = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "private", "sender.key"))
 
 # === URL of the receiver service ===
-RECEIVER_URL = "https://receiver.p2dpi.local:9443/"
+RECEIVER_URL = "https://receiver.p2dpi.local:10443/"
 
 @app.route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def proxy():
@@ -28,25 +28,62 @@ def proxy():
         kSR = load_ksr_from_file()  # Load shared secret key between Sender and Receiver
         counter = random.randint(0, 2**32 - 1)  # Random nonce/counter for PRF
         encrypted_tokens = encrypt_tokens(tokens, kSR, counter=counter)
-        print("Encrypted tokens:", encrypted_tokens.hex())  # Display encrypted tokens in hex
-        # Optionally: send encrypted_tokens to the Middlebox here
+        
+        print(f"Counter used: {counter}")
+        print("Encrypted tokens:")
+        for t in encrypted_tokens:
+            print(t.hex()) 
+
+        # Send encrypted_tokens to the Middlebox 
+        tokens_hex = [t.hex() for t in encrypted_tokens]
+        counter_hex = counter.to_bytes(4, "big").hex()
+
+
+        mb_url = "http://localhost:9999/receive_tokens"
+        try:
+            mb_response = requests.post(
+                mb_url,
+                json={
+                    "encrypted_tokens": tokens_hex,
+                    "c": counter_hex
+                },
+                timeout=3
+            )
+            print(f"Sent tokens to mb, response status: {mb_response.status_code}")
+            
+            # === Check MB verdict ===
+            if mb_response.status_code != 200:
+                print("MB responded with error, blocking request.")
+                return Response("Blocked by middlebox", status=403)
+
+            mb_data = mb_response.json()
+            if mb_data.get("status") != "ok":
+                print("MB detected rule match or suspicious traffic.")
+                return Response("Blocked by middlebox", status=403)
+
+        except requests.RequestException as e:
+            print(f"Failed to send tokens to MB: {e}")
+            return Response("Middlebox communication error", status=502)
+
     except Exception as e:
         print("Error in token processing:", e)
+        return Response("Token processing error", status=500)
 
-    # === Forward original request to Receiver ===
+     # === Forward structured request to Receiver ===
     try:
-        # Filter headers: avoid problematic ones like Host, Content-Length, etc.
-        forward_headers = {
-            key: value for key, value in request.headers.items()
-            if key.lower() not in ['host', 'content-length', 'content-encoding']
+        # Encapsulate data to send to receiver
+        structured_payload = {
+            "tokens": tokens_hex,
+            "counter": counter_hex,
+            "payload": payload.hex(),  # send raw payload in hex string
+            "headers": dict(request.headers),
+            "method": request.method
         }
 
-        # Send the request to the receiver with same method, data, and headers
-        resp = requests.request(
-            method=request.method,
+        # Send JSON to receiver
+        resp = requests.post(
             url=RECEIVER_URL,
-            headers=forward_headers,
-            data=payload,
+            json=structured_payload,
             verify=CA_CERT_PATH,
             timeout=10
         )

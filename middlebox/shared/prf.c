@@ -39,84 +39,88 @@ int H1(unsigned char *key, unsigned char *output) {
 
 // === F_KH(k, x) := (g^H1(x) * h)^k ===
 // Key-homomorphic PRF using elliptic curve exponentiation
-int FKH(BIGNUM *k, unsigned char *x_key, EC_GROUP *group, EC_POINT *result, BN_CTX *ctx) {
+int FKH(BIGNUM *k, unsigned char *x_key, EC_POINT *h_fixed, EC_GROUP *group, EC_POINT *result, BN_CTX *ctx) {
     unsigned char h1_output[16];
 
-    // Step 1: Compute H1(x) using AES
+    // Compute H1(x) using AES
     if (!H1(x_key, h1_output)) return 0;
 
-    // Step 2: Convert AES output to BIGNUM for exponentiation
+    // Convert AES output to BIGNUM for exponentiation
     BIGNUM *h1_bn = BN_bin2bn(h1_output, 16, NULL);
     if (!h1_bn) return 0;
 
-    // Step 3: Get the base point generator g of the curve
+    // Get the base point generator g of the curve
     const EC_POINT *g = EC_GROUP_get0_generator(group);
 
-    // Step 4: Generate a second random generator h
-    EC_POINT *h = EC_POINT_new(group);
-    BIGNUM *rand_bn = BN_new();
-    BN_rand(rand_bn, 160, 0, 0);  // Generate a random exponent for h
-    EC_POINT_mul(group, h, rand_bn, NULL, NULL, ctx);
-
-    // Step 5: Compute g^H1(x)
+    // Compute g^H1(x)
     EC_POINT *g_h1 = EC_POINT_new(group);
     EC_POINT_mul(group, g_h1, NULL, g, h1_bn, ctx);
 
-    // Step 6: Compute g^H1(x) * h
+    // Compute g^H1(x) * h_fixed (h fijo de la sesión)
     EC_POINT *product = EC_POINT_new(group);
-    EC_POINT_add(group, product, g_h1, h, ctx);
+    EC_POINT_add(group, product, g_h1, h_fixed, ctx);
 
-    // Step 7: Raise the result to power k: (g^H1(x) * h)^k
+    // Raise the result to power k: (g^H1(x) * h)^k
     EC_POINT_mul(group, result, NULL, product, k, ctx);
 
     // Cleanup memory
     EC_POINT_free(g_h1);
-    EC_POINT_free(h);
     EC_POINT_free(product);
     BN_free(h1_bn);
-    BN_free(rand_bn);
 
     return 1;
 }
+
+
 // === FKH_hex ===
 // Exportable version of FKH for use in Python (via ctypes)
-int FKH_hex(const char* key_str, const char* k_str, char* output_hex, int max_len) {
-    // 1. Setup curve and context
+int FKH_hex(const char* key_str, const char* k_str, const char* h_fixed_hex, char* output_hex, int max_len) {
+    // Create a new EC_GROUP object for the NIST P-256 curve
     EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    // Create a new BN_CTX object for temporary BIGNUM variables and computations
     BN_CTX *ctx = BN_CTX_new();
-    if (!group || !ctx) return 0;
 
-    // 2. Prepare key (x)
+    // Prepare the 16-byte key buffer initialized with zeros
     unsigned char key[16] = {0};
-    strncpy((char*)key, key_str, 16);  // Ensure it's 16 bytes
+    // Copy the input key string into the key buffer (ensure max 16 bytes)
+    strncpy((char*)key, key_str, 16);
 
-    // 3. Parse kMB from hex string
+    // Convert the hex string k_str to a BIGNUM object 'k'
     BIGNUM *k = NULL;
-    if (!BN_hex2bn(&k, k_str)) return 0;
+    BN_hex2bn(&k, k_str);
 
-    // 4. Result container
+    // Create a new EC_POINT object to hold the fixed 'h' point from the session
+    EC_POINT *h_fixed = EC_POINT_new(group);
+    // Convert the input hex string representation of h_fixed to EC_POINT structure
+    EC_POINT_hex2point(group, h_fixed_hex, h_fixed, ctx);
+
+    // Create an EC_POINT object to hold the final result of the computation
     EC_POINT *res = EC_POINT_new(group);
-    if (!res) return 0;
 
-    // 5. Call your original function
-    if (!FKH(k, key, group, res, ctx)) return 0;
+    // Call the core FKH function:
+    // Computes (g^{H1(x)} * h_fixed)^k over the elliptic curve group
+    int ret = FKH(k, key, h_fixed, group, res, ctx);
 
-    // 6. Convert point to hex string
+    // Convert the resulting EC_POINT 'res' to a hex string in uncompressed format
     char *pt_hex = EC_POINT_point2hex(group, res, POINT_CONVERSION_UNCOMPRESSED, ctx);
-    if (!pt_hex) return 0;
-
-    // 7. Copy safely to Python buffer
+    // Copy the hex string result safely into the output buffer
     strncpy(output_hex, pt_hex, max_len - 1);
+    // Ensure null termination
     output_hex[max_len - 1] = '\0';
 
-    // 8. Clean up
+    // Free the memory allocated for the hex string by OpenSSL
     OPENSSL_free(pt_hex);
+    // Free allocated EC_POINT objects and BIGNUMs
     EC_POINT_free(res);
+    EC_POINT_free(h_fixed);
     BN_free(k);
+    // Free the BN_CTX context
     BN_CTX_free(ctx);
+    // Free the EC_GROUP object
     EC_GROUP_free(group);
 
-    return 1;  // Success
+    // Return the result of the FKH call (1 on success, 0 on failure)
+    return ret;
 }
 
 // Inverse function for P2DPI:
@@ -199,7 +203,7 @@ cleanup:
 }
 
 int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, int max_len) {
-    // 1. Crear grupo EC y contexto BN_CTX
+    // Crear grupo EC y contexto BN_CTX
     EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
     BN_CTX *ctx = BN_CTX_new();
     if (!group || !ctx) return 0;
@@ -213,7 +217,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // 3. Convertir kSR_hex a BIGNUM
+    // Convertir kSR_hex a BIGNUM
     BIGNUM *kSR = NULL;
     if (!BN_hex2bn(&kSR, kSR_hex)) {
         EC_GROUP_free(group);
@@ -222,7 +226,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // 4. Calcular I_i = R_i^{kSR}
+    // Calcular I_i = R_i^{kSR}
     EC_POINT *point_Ii = EC_POINT_new(group);
     if (!EC_POINT_mul(group, point_Ii, NULL, point_Ri, kSR, ctx)) {
         EC_GROUP_free(group);
@@ -233,7 +237,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // 5. Convertir point_Ii a hex
+    // Convertir point_Ii a hex
     char *hex_res = EC_POINT_point2hex(group, point_Ii, POINT_CONVERSION_UNCOMPRESSED, ctx);
     if (!hex_res) {
         EC_GROUP_free(group);
@@ -244,11 +248,11 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // 6. Copiar resultado a output
+    // Copiar resultado a output
     strncpy(output_hex, hex_res, max_len - 1);
     output_hex[max_len - 1] = '\0';
 
-    // 7. Liberar recursos
+    // Liberar recursos
     OPENSSL_free(hex_res);
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
@@ -258,4 +262,40 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
 
     return 1;
 }
+
+// H2 function: AES-128-ECB encryption with key 'h_key' on input 'y_bytes' (16 bytes)
+int H2(const unsigned char *y_bytes, int y_len, const unsigned char *h_key, unsigned char *output) {
+    // Check input length; y_bytes must be exactly 16 bytes for AES block size
+    if (y_len != 16) {
+        fprintf(stderr, "H2 input y must be 16 bytes\n");
+        return 0;
+    }
+
+    // Create and initialize a new EVP cipher context
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int out_len = 0;
+
+    // Initialize encryption operation with AES-128-ECB mode and the provided key
+    if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, h_key, NULL)) {
+        fprintf(stderr, "EVP_EncryptInit_ex failed.\n");
+        EVP_CIPHER_CTX_free(ctx);
+        return 0;
+    }
+
+    // Disable padding to ensure output is exactly 16 bytes (AES block size)
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    // Perform the encryption of the input data y_bytes
+    if (!EVP_EncryptUpdate(ctx, output, &out_len, y_bytes, y_len)) {
+        fprintf(stderr, "EVP_EncryptUpdate failed.\n");
+        EVP_CIPHER_CTX_free(ctx);
+        return 0;
+    }
+
+    // Clean up and free the cipher context
+    EVP_CIPHER_CTX_free(ctx);
+
+    return 1;
+}
+
 
