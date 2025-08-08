@@ -1,4 +1,4 @@
-# sender/sender_main.py
+# sender/sender_http.py
 
 from flask import Flask, request, jsonify
 from sender_utils import load_public_key, verify_signature, load_ksr_from_file, compute_intermediate_rules_hex
@@ -6,7 +6,6 @@ from sender_utils import load_public_key, verify_signature, load_ksr_from_file, 
 import os
 import requests
 import logging
-
 
 
 app = Flask(__name__)

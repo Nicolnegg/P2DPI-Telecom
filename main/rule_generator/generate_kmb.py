@@ -1,16 +1,16 @@
 import os
 import requests
 
-# === Generate 128-bit (16 bytes) key ===
+# Generate 128-bit (16 bytes) key 
 kmb = os.urandom(16)
 
-# === Define output directories ===
+# Define output directories
 rg_dir = os.path.join("middlebox", "rule_generator", "keys")
 
-# === Create directories if not exist ===
+# Create directories if not exist 
 os.makedirs(rg_dir, exist_ok=True)
 
-# === Write key to RG ===
+# Write key to RG 
 kmb_path = os.path.join(rg_dir, "kmb.key")
 with open(kmb_path, "wb") as f:
     f.write(kmb)
@@ -18,7 +18,7 @@ with open(kmb_path, "wb") as f:
 print("kMB generated and stored securely in:")
 print(" -", kmb_path)
 
-# === Send key to MB via API ===
+# Send key to MB via API 
 
 # Convert to hex for JSON transmission
 kmb_hex = kmb.hex()

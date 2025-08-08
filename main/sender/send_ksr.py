@@ -3,14 +3,14 @@ import secrets
 import os
 import sys
 
-# === Configuration ===
+# === Configuration === Run before to sned the data
 
 # Generate a 128-bit key (16 bytes = 32 hex chars)
 ksr = secrets.token_hex(16)
 print("[Sender] Generated kSR:", ksr)
 
 # Receiver URL (must match TLS CN/SAN)
-url = "https://receiver.p2dpi.local:10000/receive_ksr"
+url = "https://receiver.p2dpi.local:10443/receive_ksr"
 
 # === Resolve paths ===
 

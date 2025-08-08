@@ -8,10 +8,10 @@ shared_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shar
 private_key_path = os.path.join(private_key_dir, 'rg_private_key.pem')
 public_key_path = os.path.join(shared_dir, 'rg_public_key.pem')
 
-# Generar clave privada RSA 2048 bits
+# Generate a 2048-bit RSA private key
 private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-# Guardar clave privada (sin cifrado)
+# Save the private key (unencrypted)
 with open(private_key_path, "wb") as f:
     f.write(private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -19,7 +19,7 @@ with open(private_key_path, "wb") as f:
         encryption_algorithm=serialization.NoEncryption()
     ))
 
-# Guardar clave pública en shared/keys
+# Save the public key in shared/keys directory
 with open(public_key_path, "wb") as f:
     f.write(private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,

@@ -6,7 +6,6 @@ from receiver_utils import encrypt_tokens, load_ksr, load_prf_library, load_h_fi
 
 
 import os
-import requests
 import re
 
 
@@ -16,12 +15,11 @@ app = Flask("receiver_https")
 current_dir = os.path.dirname(os.path.abspath(__file__))
 KSR_ENCRYPTED_PATH = os.path.abspath(os.path.join(current_dir, 'keys', 'shared_ksr.key'))
 KSR_ENCRYPTION_KEY_PATH = os.path.abspath(os.path.join(current_dir, 'keys', 'key_for_ksr.key'))
-REAL_SERVER_URL = "https://server.p2dpi.local:9443/" 
 CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
 
 STORED_ENCRYPTED_TOKENS = []  
 STORED_COUNTER = None
-ENCRYPTED_TOKENS_EXPECTED = []
+ENCRYPTED_TOKENS_RECEIVED = []
 
 prf = load_prf_library()
 h_fixed_hex = load_h_fixed()
@@ -35,6 +33,7 @@ except Exception as e:
 # Regular expression to match a valid hexadecimal string (case-insensitive)
 HEX_PATTERN = re.compile(r'^[0-9a-fA-F]+$')
 
+# === Endpoint to securely receive and store the shared key (kSR) ===
 @app.route("/receive_ksr", methods=["POST"])
 def receive_ksr():
     """
@@ -78,16 +77,16 @@ def receive_ksr():
         print(f"[Receiver HTTPS] Error storing kSR: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-# === Endpoint que recibe tráfico del sender y lo reenvía al servidor real ===
+# === Endpoint that receives traffic from the Sender and processes it as the final server ===
 @app.route("/", methods=["POST"])
 def handle_sender_request():
     """
-    Receives a request from Sender containing both tokens and traffic.
-    1. Encrypts and compares the tokens {ti} with stored {T'i}.
-    2. If they match, forwards the payload to the real server.
-    3. If mismatch, alerts the Middlebox and blocks the forwarding.
+    Main HTTPS endpoint at the Receiver.
+    Processes requests from Sender containing encrypted tokens, a counter, and payload.
+    Verifies tokens against those from the Middlebox; if valid, parses and responds with the payload data.
+    The Receiver is the final server and handles the request directly without forwarding.
     """
-    global ENCRYPTED_TOKENS_EXPECTED, STORED_ENCRYPTED_TOKENS, STORED_COUNTER
+    global ENCRYPTED_TOKENS_RECEIVED, STORED_ENCRYPTED_TOKENS, STORED_COUNTER
 
     # Parse JSON body
     try:
@@ -112,19 +111,14 @@ def handle_sender_request():
     except ValueError:
         return jsonify({"error": "Invalid counter format"}), 400
 
-    
-    print(f"[DEBUG] kSR = {kSR}")
-    print(f"[DEBUG] h_fixed_hex = {h_fixed_hex}")
-    print(f"[DEBUG] prf functions loaded: {dir(prf)}")
-
     try:
         # Convert tokens
         tokens_bytes = [bytes.fromhex(t) for t in tokens_hex]
         encrypted_tokens = encrypt_tokens(tokens_bytes, kSR, counter_int, prf, h_fixed_hex)
-        ENCRYPTED_TOKENS_EXPECTED = [t.hex() for t in encrypted_tokens]
+        ENCRYPTED_TOKENS_RECEIVED = [t.hex() for t in encrypted_tokens]
 
-        print("[Receiver HTTPS] Encrypted tokens received:")
-        for t in ENCRYPTED_TOKENS_EXPECTED:
+        print("[Receiver HTTPS] Encrypted tokens received, calculate in Receiver:")
+        for t in ENCRYPTED_TOKENS_RECEIVED:
             print(t)
             
         print("[Receiver HTTPS] Stored tokens from MB:")
@@ -145,8 +139,8 @@ def handle_sender_request():
             send_alert_to_middlebox(alert_message)
             return jsonify({"status": "ALERT: Counter mismatch"}), 403
 
-        # Compare tokens
-        for idx, (recv_t, ref_t) in enumerate(zip(ENCRYPTED_TOKENS_EXPECTED, STORED_ENCRYPTED_TOKENS)):
+        # Compare tokens Ti and T'i
+        for idx, (recv_t, ref_t) in enumerate(zip(ENCRYPTED_TOKENS_RECEIVED, STORED_ENCRYPTED_TOKENS)):
             if recv_t != ref_t:
                 alert_message = {
                     "alert": "Token mismatch",
@@ -159,30 +153,26 @@ def handle_sender_request():
 
         print("[Receiver HTTPS] Tokens validated successfully. Forwarding to real server.")
 
-        # Prepare headers and send to real server
-        excluded_headers = ['host', 'content-length', 'content-encoding', 'transfer-encoding', 'connection']
-        forward_headers = {k: v for k, v in inner_headers.items() if k.lower() not in excluded_headers}
-
-        # Reconstruct raw payload
+        # Reconstruct raw payload from hex string
         payload_bytes = bytes.fromhex(inner_payload)
 
-        # Forward to real server
-        response = requests.request(
-            method=method,
-            url=REAL_SERVER_URL,
-            headers=forward_headers,
-            data=payload_bytes,
-            verify=CA_CERT_PATH,
-            timeout=10
-        )
+        # Try to decode the payload as a URL-encoded form 
+        try:
+            form_data = {}
+            raw_text = payload_bytes.decode(errors="ignore")  # Decode bytes to string
+            for pair in raw_text.split("&"):  # Split into key-value pairs
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    form_data[k] = v
+        except Exception as e:
+            # If decoding fails, return raw hex string as fallback
+            form_data = {"raw_payload": payload_bytes.hex()}
 
-        # Return response from real server
-        resp = Response(response.content, status=response.status_code)
-        for key, value in response.headers.items():
-            if key.lower() not in excluded_headers:
-                resp.headers[key] = value
+        # Print extracted form data (or raw data) for debugging
+        print("Receiver (server) received POST data:", form_data)
 
-        return resp
+        # Return the processed data back to the sender as JSON
+        return jsonify({"status": "received", "data": form_data}), 200
 
     except Exception as e:
         print(f"[Receiver HTTPS] Error: {e}")
@@ -227,6 +217,50 @@ def store_tokens():
 
     # return success status to the middlebox
     return jsonify({"status": "Tokens stored successfully"}), 200
+
+# --- ENDPOINT TO DELETE MALICIOUS TOKENS SENT BY SENDER ---
+@app.route("/delete_tokens", methods=["POST"])
+def delete_tokens():
+    """
+    Deletes all stored tokens associated with a given counter, 
+    effectively blocking that traffic.
+    """
+
+    global STORED_ENCRYPTED_TOKENS, STORED_COUNTER
+
+    data = request.json
+    counter = data.get("counter")  # hex string
+
+    if counter is None:
+        return jsonify({"error": "Missing counter"}), 400
+
+    # Validate counter format (hex string)
+    if not isinstance(counter, str) or not HEX_PATTERN.fullmatch(counter):
+        return jsonify({"error": "Counter is not a valid hexadecimal string"}), 400
+
+    # Check if there are stored tokens and a valid stored counter
+    if not STORED_ENCRYPTED_TOKENS or STORED_COUNTER is None:
+        return jsonify({
+            "status": "No suspicious traffic stored",
+            "message": "No tokens or traffic to delete"
+        }), 200
+
+    # Check if the stored counter matches the received counter
+    if STORED_COUNTER != counter:
+        return jsonify({"error": "Counter mismatch; cannot delete tokens"}), 409
+
+    # Delete all stored tokens and reset the counter
+    deleted_count = len(STORED_ENCRYPTED_TOKENS)
+    STORED_ENCRYPTED_TOKENS = []
+    STORED_COUNTER = None
+
+    print(f"[Receiver HTTPS] Deleted all ({deleted_count}) stored tokens for counter {counter}")
+
+    return jsonify({
+        "status": "All tokens deleted",
+        "deleted_count": deleted_count
+    }), 200
+
 
 def run_https():
     """

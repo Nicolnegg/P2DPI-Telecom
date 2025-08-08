@@ -10,6 +10,7 @@ import struct
 import os
 import base64
 import logging
+import hashlib
 
 BUFFER_SIZE = 200
 TOKEN_WINDOW_SIZE = 8
@@ -51,7 +52,6 @@ def extract_tokens_sliding_window(payload: bytes, window_size=TOKEN_WINDOW_SIZE)
     return [payload[i:i+window_size] for i in range(len(payload) - window_size + 1)]
 
 
-
 def encrypt_tokens(tokens, kSR_hex, counter):
     """
     Encrypt tokens as Ti = H2(c + i, (g^{H1(ti)} h)^{kSR}).
@@ -61,28 +61,28 @@ def encrypt_tokens(tokens, kSR_hex, counter):
 
     for i, token_bytes in enumerate(tokens):
         # Compute (g^{H1(ti)} * h)^{kSR} using FKH_hex
-        token_hex = token_bytes.hex().upper()
 
-        # Read EC point hex result from the last call's buffer (reuse buffer)
-        # Actually, better to store the output explicitly:
-        output_buffer_fk = create_string_buffer(BUFFER_SIZE)  # char* buffer
+        # pass raw token bytes (not hex ASCII). C expects up to 16 raw bytes.
+        key_buf = token_bytes[:16]               # same as strncpy(..., key_str, 16) in C
+        output_buffer_fk = create_string_buffer(BUFFER_SIZE)
+
         res = prf.FKH_hex(
-            c_char_p(token_hex.encode()),
-            c_char_p(kSR_hex.encode()),
-            c_char_p(h_fixed_hex.encode()),
+            c_char_p(key_buf),                   # raw bytes, not hex string
+            c_char_p(kSR_hex.encode()),          # kSR as hex string (C uses BN_hex2bn)
+            c_char_p(h_fixed_hex.encode()),      # h_fixed hex string
             output_buffer_fk,
             BUFFER_SIZE
         )
+
         if res != 1:
-            raise RuntimeError(f"FKH_hex failed for token {token_hex}")
+            raise RuntimeError(f"FKH_hex failed for token {i}")
 
         point_hex = output_buffer_fk.value.decode()
-
-        # Convert EC point hex to bytes, take first 16 bytes as AES key for H2
+        
+        # Convert EC point hex to bytes and hash it to get AES key
         point_bytes = bytes.fromhex(point_hex)
-        if len(point_bytes) < 16:
-            raise RuntimeError(f"EC point bytes too short for token {token_hex}")
-        h2_key = (c_ubyte * 16).from_buffer_copy(point_bytes[:16])
+        hash_point = hashlib.sha256(point_bytes).digest()
+        h2_key = (c_ubyte * 16).from_buffer_copy(hash_point[:16])
 
         # Prepare y = counter + i as 16-byte big endian
         y_int = counter + i
@@ -128,28 +128,24 @@ def verify_signature(data: str, signature_b64: str, public_key) -> bool:
         return False
 
 def compute_intermediate_rules_hex(rules_hex, kSR_hex):
-    """
-    Given a list of obfuscated rules (hex strings), compute the intermediate rules using FKH.
-    Args:
-        rules_hex (List[str]): Obfuscated rule values (hex-encoded strings).
-        kSR_hex (str): Session key shared between Sender and Receiver.
-    Returns:
-        List[str]: List of intermediate rule values.
-    """
     results = []
     output_buffer = create_string_buffer(BUFFER_SIZE)
-    for r in rules_hex:
-        res = prf.FKH_hex(
-            c_char_p(r.encode()),
-            c_char_p(kSR_hex.encode()),
-            c_char_p(h_fixed_hex.encode()),
-            output_buffer,
-            BUFFER_SIZE
+
+    for r in rules_hex:  # r is Ri in hexadecimal string format
+        # Previously: prf.FKH_hex(c_char_p(r.encode()), ...)
+        # Now: use EC_POINT_exp_hex to compute I_i = Ri ^ kSR
+        res = prf.EC_POINT_exp_hex(
+            c_char_p(r.encode()),          # Ri as ASCII hex (C will interpret correctly)
+            c_char_p(kSR_hex.encode()),    # kSR as hex string
+            output_buffer,                 # output buffer to store the resulting EC point
+            BUFFER_SIZE                    # maximum buffer size
         )
         if res != 1:
-            logging.error(f"FKH_hex failed for input: {r}")
-            raise RuntimeError(f"FKH_hex failed for input: {r}")
+            raise RuntimeError(f"EC_POINT_exp_hex failed for Ri: {r}")
+
+        # Append the computed intermediate rule I_i (as hex string) to results
         results.append(output_buffer.value.decode())
+
     return results
     
 def load_ksr_from_file():

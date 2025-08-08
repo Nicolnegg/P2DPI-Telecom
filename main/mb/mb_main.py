@@ -3,7 +3,8 @@ from flask import Flask, request, jsonify
 import requests
 from ctypes import cast, CDLL, c_char_p, c_int, create_string_buffer, c_ubyte, POINTER
 import os
-import hashlib 
+import hashlib
+import struct
 
 
 app = Flask(__name__)
@@ -18,7 +19,7 @@ kmb_buf = None  # Keep a reference so GC doesn't free the buffer
 
 RECEIVER_URL = "https://receiver.p2dpi.local:10443/store_tokens" 
 CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
-
+RECEIVER_DELETE_URL = "https://receiver.p2dpi.local:10443/delete_tokens" 
 
 # === Load PRF (FKH_inv_hex) ===
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +78,7 @@ def h2_compute(counter_i, session_key_hex):
     Returns: 16-byte AES-ECB encrypted output as hex string
     """
     # Prepare input y_bytes: 4 bytes big-endian + 12 zero bytes
-    y_bytes = counter_i.to_bytes(4, 'big') + b'\x00' * 12
+    y_bytes = struct.pack(">QQ", 0, counter_i)
     y_buf = create_string_buffer(y_bytes, 16)
 
     # Convert hex string point Sj to bytes
@@ -108,46 +109,6 @@ def h2_compute(counter_i, session_key_hex):
 
     return output_buf.raw.hex()
 
-def send_and_validate_tokens(tokens, counter_int):
-    """
-    Sends the encrypted tokens and counter to the Receiver (R) for validation.
-    This function is called from the Middlebox (MB) to verify whether the
-    traffic it observed is legitimate and authorized according to the session rules.
-
-    Parameters:
-        tokens (list of str): Encrypted tokens {Ti} in hexadecimal string format.
-        counter_int (int): The base counter value 'c' used to compute Ti = H2(c + i, ...)
-    """
-    # Convert counter to hex string (remove "0x" prefix)
-    counter_hex = hex(counter_int)[2:]
-
-    # Create JSON payload to send to the Receiver
-    payload = {
-        "tokens": tokens,     # Encrypted tokens as hex strings
-        "counter": counter_hex
-    }
-
-    try:
-        print("[MB ➜ R] Sending tokens to receiver for validation...")
-
-        # Send POST request to Receiver for validation (with TLS verification)
-        response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
-
-        # Log the response from Receiver
-        print(f"[MB ➜ R] Receiver response: {response.status_code} - {response.text}")
-
-        # Parse response: check if status is OK (tokens are valid)
-        if response.status_code == 200 and response.json().get("status") == "OK":
-            print("[MB] Tokens validated successfully by Receiver.")
-            return True
-        else:
-            print("[MB] ALERT: Traffic differs! Possible attack detected.")
-            return False
-
-    except Exception as e:
-        # Handle network, TLS, or parsing errors
-        print(f"[MB] Error sending tokens to Receiver: {e}")
-        return False
 
 # === Endpoint to receive and forward obfuscated rules ===
 @app.route("/upload_rules", methods=["POST"])
@@ -293,10 +254,37 @@ def receive_tokens():
         for j, Sj in enumerate(SESSION_RULES):
             # Compute H2(c + i, Sj) using the C function
             h2_val = h2_compute(counter + i, Sj)
+
             # Compare the computed H2 value with the received token (case-insensitive)
             if h2_val.lower() == Ti.lower():
                 print(f"[ALERT] Match found! Token {i} matches H2(c+i, S{j})")
                 alert_raised = True
+                break
+        if alert_raised:
+            break
+    
+    if alert_raised:
+        # immediately return a response indicating a malicious token was detected
+        
+        # Inform the Receiver to delete all stored tokens for this counter
+        try:
+            delete_payload = {
+                "counter": c_hex  # Only the counter is needed now
+            }
+            delete_response = requests.post(
+                RECEIVER_DELETE_URL,
+                json=delete_payload,
+                verify=CA_CERT_PATH,
+                timeout=5
+            )
+            print(f"[MB ➜ R] Notify Receiver to delete tokens response: {delete_response.status_code} - {delete_response.text}")
+        except Exception as e:
+            print(f"[MB] Failed to notify Receiver about malicious tokens: {e}")
+            
+        return jsonify({
+            "status": "alert",
+            "message": "Malicious token detected. Transmission blocked."
+        }), 403  # HTTP 403 Forbidden status code, or any other you prefer
 
     # Send tokens and counter to the Receiver to store them
     payload = {
@@ -321,6 +309,7 @@ def receive_tokens():
     if alert_raised:
         return jsonify({"status": "alert"}), 200
     else:
+        print("[MB] ✅ No matches found. Traffic considered safe.")
         return jsonify({"status": "ok"}), 200
 
 # === Endpoint to receive alerts from Receiver indicating possible attack ===
@@ -336,8 +325,6 @@ def receive_alert_from_receiver():
 
     print("\n[MB] ⚠️ ALERT RECEIVED FROM RECEIVER ⚠️")
     print("[MB] Details:", alert_data)
-
-    # Optional: log to file or trigger other detection mechanisms here
 
     return jsonify({"status": "Alert received"}), 200
 

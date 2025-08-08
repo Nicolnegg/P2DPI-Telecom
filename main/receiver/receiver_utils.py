@@ -9,6 +9,7 @@ import struct
 import os
 import base64
 import requests
+import hashlib
 
 # Load the PRF shared library (prf.so) and define argument and return types for FKH_hex
 # Returns the loaded CDLL object
@@ -141,14 +142,11 @@ def encrypt_tokens(tokens: list, kSR_hex: str, counter: int, prf, h_fixed_hex: s
 
     for i, token_bytes in enumerate(tokens):
         # Token hex uppercase string
-        token_hex = token_bytes.hex().upper()
-
-        # Buffer for FKH_hex output
+        key_buf = token_bytes[:16]
         output_buffer_fk = create_string_buffer(BUFFER_SIZE)
 
-        # Call FKH_hex to compute EC point (g^{H1(ti)} * h)^{kSR}
         res = prf.FKH_hex(
-            c_char_p(token_hex.encode()),
+            key_buf,  # bytes
             c_char_p(kSR_hex.encode()),
             c_char_p(h_fixed_hex.encode()),
             output_buffer_fk,
@@ -163,7 +161,8 @@ def encrypt_tokens(tokens: list, kSR_hex: str, counter: int, prf, h_fixed_hex: s
             raise RuntimeError(f"EC point bytes too short for token {token_hex}")
 
         # Use first 16 bytes as key for H2
-        h2_key = (c_ubyte * 16).from_buffer_copy(point_bytes[:16])
+        aes_key = hashlib.sha256(point_bytes).digest()[:16]
+        h2_key = (c_ubyte * 16).from_buffer_copy(aes_key)
 
         # Prepare y = c + i as 16-byte big endian (upper 8 bytes zero, lower 8 bytes counter)
         y_int = counter + i
@@ -192,3 +191,5 @@ def send_alert_to_middlebox(alert_data):
         print(f"[Receiver HTTPS] Alert sent to Middlebox: {response.status_code}")
     except Exception as e:
         print(f"[Receiver HTTPS] Failed to send alert to Middlebox: {e}")
+
+

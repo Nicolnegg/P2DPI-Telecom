@@ -31,14 +31,9 @@ h_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'h_fixed.txt'
 with open(h_path, 'r') as f:
     h_fixed_hex = f.read().strip()
 
-print("[DEBUG] Loaded fixed point h from:", h_path)
-
-
 # Example detection rules
 RULES = [
-    {"id": "rule1", "pattern": "malicious-content"},
-    {"id": "rule2", "pattern": "suspicious-token"},
-    {"id": "rule3", "pattern": "cmd.exe"},
+    {"id": "rule1", "pattern": "=cmd.exe"}
 ]
 
 def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
@@ -70,7 +65,6 @@ def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
 
     return output_buffer.value.decode()
 
-# run before middlebox/mb/rule_receiver.py
 def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     session_rules = []
     print("[RG] Generating, obfuscating and signing rules...")
@@ -79,13 +73,13 @@ def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     private_key = load_private_key(os.path.join(current_dir, 'keys', 'rg_private_key.pem'))
 
     for rule in RULES:
-        # 1) Obfuscate the detection rule using the C PRF (FKH_hex)
+        # Obfuscate the detection rule using the C PRF (FKH_hex)
         obf_rule = obfuscate_rule_fkh(rule["pattern"], K_MB_HEX, h_fixed_hex)
 
-        # 2) Sign the obfuscated rule string using RSA-PSS
+        # Sign the obfuscated rule string using RSA-PSS
         signature = sign_data(obf_rule, private_key)
 
-        # 3) Append obfuscated rule and signature to the list
+        # Append obfuscated rule and signature to the list
         session_rules.append({
             "obfuscated": obf_rule,
             "signature": signature

@@ -1,3 +1,5 @@
+# sender/sender_https.py
+
 from flask import Flask, request, Response
 import requests
 import random
@@ -25,6 +27,12 @@ def proxy():
     # === Extract and encrypt tokens ===
     try:
         tokens = extract_tokens_sliding_window(payload)  # Extract tokens using sliding window
+        
+        # BORRAR ESTO Imprime tokens extraídos en hex para debug
+        for token in tokens:
+            print(f"Token: {token.hex()} - ASCII: {token.decode(errors='ignore')}")
+
+        
         kSR = load_ksr_from_file()  # Load shared secret key between Sender and Receiver
         counter = random.randint(0, 2**32 - 1)  # Random nonce/counter for PRF
         encrypted_tokens = encrypt_tokens(tokens, kSR, counter=counter)
@@ -73,7 +81,7 @@ def proxy():
     try:
         # Encapsulate data to send to receiver
         structured_payload = {
-            "tokens": tokens_hex,
+            "tokens": [t.hex() for t in tokens], #traffic without encription
             "counter": counter_hex,
             "payload": payload.hex(),  # send raw payload in hex string
             "headers": dict(request.headers),
@@ -102,6 +110,30 @@ def proxy():
     except Exception as e:
         print("Forwarding failed:", e)
         return Response("Forwarding error", status=502)
+    
+#==Change this payload for test
+@app.route("/send_test_data", methods=["GET"])
+def trigger_test_client_request():
+    """
+    Simulates a client request from inside the sender, manually triggered.
+    """
+    import requests
+
+    data = {
+        "username": "alice",
+        "password": "cmd.exe"
+    }
+
+    try:
+        response = requests.post(
+            "https://sender.p2dpi.local:8443/",
+            data=data,
+            verify=CA_CERT_PATH
+        )
+        return f"[LOCAL CLIENT] POST response: {response.text}", response.status_code
+
+    except Exception as e:
+        return f"[LOCAL CLIENT] Error: {str(e)}", 500
 
 # === Run HTTPS server with Flask SSL context ===
 if __name__ == "__main__":

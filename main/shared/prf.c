@@ -11,7 +11,7 @@ const unsigned char SALT[16] = {
     0x89, 0xab, 0xcd, 0xef,
     0x10, 0x32, 0x54, 0x76,
     0x98, 0xba, 0xdc, 0xfe
-}; // Static salt for AES encryption in H1 (you can replace this with dynamic salt)
+}; // Static salt for AES encryption in H1
 
 // === H1(x) := AES128_x(SALT) ===
 // Simulates a programmable random oracle using AES as PRF
@@ -60,6 +60,8 @@ int FKH(BIGNUM *k, unsigned char *x_key, EC_POINT *h_fixed, EC_GROUP *group, EC_
     EC_POINT *product = EC_POINT_new(group);
     EC_POINT_add(group, product, g_h1, h_fixed, ctx);
 
+    
+
     // Raise the result to power k: (g^H1(x) * h)^k
     EC_POINT_mul(group, result, NULL, product, k, ctx);
 
@@ -73,6 +75,7 @@ int FKH(BIGNUM *k, unsigned char *x_key, EC_POINT *h_fixed, EC_GROUP *group, EC_
 
 
 // === FKH_hex ===
+//  raw token bytes (copied into a 16-byte buffer)
 // Exportable version of FKH for use in Python (via ctypes)
 int FKH_hex(const char* key_str, const char* k_str, const char* h_fixed_hex, char* output_hex, int max_len) {
     // Create a new EC_GROUP object for the NIST P-256 curve
@@ -203,12 +206,12 @@ cleanup:
 }
 
 int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, int max_len) {
-    // Crear grupo EC y contexto BN_CTX
+    // Create elliptic curve group and big number context
     EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
     BN_CTX *ctx = BN_CTX_new();
     if (!group || !ctx) return 0;
 
-    // 2. Convertir Ri_hex a EC_POINT
+    // Convert Ri (hex string) to EC_POINT
     EC_POINT *point_Ri = EC_POINT_new(group);
     if (!EC_POINT_hex2point(group, Ri_hex, point_Ri, ctx)) {
         EC_GROUP_free(group);
@@ -217,7 +220,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // Convertir kSR_hex a BIGNUM
+    // Convert kSR (hex string) to BIGNUM
     BIGNUM *kSR = NULL;
     if (!BN_hex2bn(&kSR, kSR_hex)) {
         EC_GROUP_free(group);
@@ -226,7 +229,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // Calcular I_i = R_i^{kSR}
+    // Compute I_i = R_i ^ kSR (scalar multiplication)
     EC_POINT *point_Ii = EC_POINT_new(group);
     if (!EC_POINT_mul(group, point_Ii, NULL, point_Ri, kSR, ctx)) {
         EC_GROUP_free(group);
@@ -237,7 +240,7 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // Convertir point_Ii a hex
+    // Convert resulting point I_i to hex string
     char *hex_res = EC_POINT_point2hex(group, point_Ii, POINT_CONVERSION_UNCOMPRESSED, ctx);
     if (!hex_res) {
         EC_GROUP_free(group);
@@ -248,11 +251,11 @@ int EC_POINT_exp_hex(const char* Ri_hex, const char* kSR_hex, char* output_hex, 
         return 0;
     }
 
-    // Copiar resultado a output
+    // Copy hex result to output buffer
     strncpy(output_hex, hex_res, max_len - 1);
-    output_hex[max_len - 1] = '\0';
+    output_hex[max_len - 1] = '\0';  // Ensure null-termination
 
-    // Liberar recursos
+    // Free all allocated resources
     OPENSSL_free(hex_res);
     EC_GROUP_free(group);
     BN_CTX_free(ctx);

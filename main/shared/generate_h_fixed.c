@@ -8,6 +8,12 @@
 #include <openssl/err.h>
 #include <openssl/obj_mac.h>
 
+/*
+ * Generates a fixed EC point `h` on the P-256 curve by multiplying
+ * the generator by a random scalar. Saves `h` as a hex string to
+ * "h_fixed.txt" in the executable's directory.
+*/
+
 int main(int argc, char *argv[]) {
     int ret = 1;
     EC_GROUP *group = NULL;

@@ -16,6 +16,8 @@ from receiver_utils import (
 import requests
 import os
 
+BUFFER_SIZE = 200
+
 # Flask HTTP app instance
 app = Flask("receiver_http")
 
@@ -24,9 +26,45 @@ prf = load_prf_library()
 h_fixed_hex = load_h_fixed()
 
 # Load RG public key
-current_dir = __file__
+current_dir = os.path.abspath(__file__)
 public_key_path = os.path.abspath(os.path.join(os.path.dirname(current_dir), '..', 'shared', 'keys', 'rg_public_key.pem'))
 rg_public_key = load_public_key(public_key_path)
+
+
+
+def compute_intermediate_rules_hex(rules_hex, kSR_hex):
+    """
+    Compute intermediate rules I_i from obfuscated rules R_i using EC_POINT_exp_hex.
+
+    Args:
+        rules_hex (list): List of R_i values in hexadecimal string format.
+        kSR_hex (str): The shared key kSR in hexadecimal string format.
+
+    Returns:
+        list: List of computed intermediate rules I_i as hex strings.
+
+    Raises:
+        RuntimeError: If EC_POINT_exp_hex computation fails for any rule.
+    """
+    results = []
+    output_buffer = create_string_buffer(BUFFER_SIZE)
+
+    for r in rules_hex:  # r is R_i in hexadecimal string format
+        # Previously: prf.FKH_hex(c_char_p(r.encode()), ...)
+        # Now: use EC_POINT_exp_hex to compute I_i = R_i ^ kSR
+        res = prf.EC_POINT_exp_hex(
+            c_char_p(r.encode()),          # R_i as ASCII hex (C will interpret correctly)
+            c_char_p(kSR_hex.encode()),    # kSR as hex string
+            output_buffer,                 # output buffer to store the resulting EC point
+            BUFFER_SIZE                    # maximum buffer size
+        )
+        if res != 1:
+            raise RuntimeError(f"EC_POINT_exp_hex failed for R_i: {r}")
+
+        # Append the computed intermediate rule I_i (as hex string) to results
+        results.append(output_buffer.value.decode())
+
+    return results
 
 # === Receive detection rules, verify, compute I_i, and send to MB ===
 @app.route('/receive_rules', methods=['POST'])
@@ -54,22 +92,15 @@ def receive_rules():
         print(f"[Receiver] Failed to load kSR: {e}")
         return jsonify({"error": "Failed to load kSR"}), 500
 
-    # Compute intermediate rules
-    output_buffer = create_string_buffer(200)
-    intermediate_rules = []
-    for entry in data:
-        Ri = entry["obfuscated"]
-        res = prf.FKH_hex(
-            c_char_p(Ri.encode()),
-            c_char_p(kSR.encode()),
-            c_char_p(h_fixed_hex.encode()),
-            output_buffer,
-            200
-        )
-        if res != 1:
-            return jsonify({"error": f"FKH failed for rule: {Ri}"}), 500
-        Ii = output_buffer.value.decode()
-        intermediate_rules.append(Ii)
+    # Prepare list of R_i values
+    rules_hex = [r for r in (entry.get("obfuscated") for entry in data) if r]
+
+
+    try:
+        # Compute intermediate rules using the helper function
+        intermediate_rules = compute_intermediate_rules_hex(rules_hex, kSR)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
 
     print("[Receiver] Computed all intermediate rules.")
 
