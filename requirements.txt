@@ -1,0 +1,8 @@
+#!/bin/bash
+# Install dependencies for your Flask project with Requests and ctypes
+
+flask
+requests
+cryptography
+yaramod
+

@@ -33,7 +33,7 @@ with open(h_path, 'r') as f:
 
 # Example detection rules
 RULES = [
-    {"id": "rule1", "pattern": "=cmd.exe"}
+    {"id": "rule1", "pattern": "tockens"}
 ]
 
 def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
@@ -65,6 +65,20 @@ def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
 
     return output_buffer.value.decode()
 
+def split_into_tokens(pattern: str, size: int = 8):
+    """
+    Split the pattern into fixed-size tokens.
+    """
+    return [pattern[i:i+size] for i in range(0, len(pattern), size)]
+
+
+def split_into_tokens(pattern: str, size: int = 8):
+    """
+    Split the pattern into fixed-size tokens.
+    """
+    return [pattern[i:i+size] for i in range(0, len(pattern), size)]
+
+
 def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     session_rules = []
     print("[RG] Generating, obfuscating and signing rules...")
@@ -73,19 +87,27 @@ def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     private_key = load_private_key(os.path.join(current_dir, 'keys', 'rg_private_key.pem'))
 
     for rule in RULES:
-        # Obfuscate the detection rule using the C PRF (FKH_hex)
-        obf_rule = obfuscate_rule_fkh(rule["pattern"], K_MB_HEX, h_fixed_hex)
 
-        # Sign the obfuscated rule string using RSA-PSS
-        signature = sign_data(obf_rule, private_key)
+        # Split the rule into 8-character tokens
+        tokens = split_into_tokens(rule["pattern"], 8)
 
-        # Append obfuscated rule and signature to the list
-        session_rules.append({
-            "obfuscated": obf_rule,
-            "signature": signature
-        })
+        for idx, token in enumerate(tokens):
 
-        print(f"[RG] Rule {rule['id']} obfuscated and signed.")
+            # Obfuscate the detection token using the C PRF (FKH_hex)
+            obf_rule = obfuscate_rule_fkh(token, K_MB_HEX, h_fixed_hex)
+
+            # Sign the obfuscated rule string using RSA-PSS
+            signature = sign_data(obf_rule, private_key)
+
+            # Append obfuscated rule and signature to the list
+            session_rules.append({
+                "rule_id": rule["id"],
+                "token_index": idx,
+                "obfuscated": obf_rule,
+                "signature": signature
+            })
+
+            print(f"[RG] Rule {rule['id']} - Token {idx} obfuscated and signed.")
 
     # Send all rules to Middlebox
     try:
