@@ -60,6 +60,9 @@ def encrypt_tokens(tokens, kSR_hex, counter):
     encrypted_tokens = []
 
     for i, token_bytes in enumerate(tokens):
+        # Normalize the token to lowercase
+        token_bytes = token_bytes.decode(errors="ignore").lower().encode()
+        
         # Compute (g^{H1(ti)} * h)^{kSR} using FKH_hex
 
         # pass raw token bytes (not hex ASCII). C expects up to 16 raw bytes.

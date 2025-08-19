@@ -121,7 +121,7 @@ def trigger_test_client_request():
 
     data = {
         "username": "alice",
-        "password": "tockens"
+        "password": "Ltockens"
     }
 
     try:

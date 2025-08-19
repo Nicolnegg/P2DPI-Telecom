@@ -33,7 +33,7 @@ with open(h_path, 'r') as f:
 
 # Example detection rules
 RULES = [
-    {"id": "rule1", "pattern": "tockens"}
+    {"id": "rule1", "pattern": "ltockens"}
 ]
 
 def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
@@ -48,6 +48,9 @@ def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
     Returns:
         The obfuscated rule Ri as a hex string.
     """
+    # Normalize pattern to lowercase
+    pattern = pattern.lower()
+
     # Prepare key string: max 16 bytes padded with zeroes
     key_str = pattern.encode("utf-8")
     kmb_hex_bytes = kmb_hex_str.encode("utf-8")
