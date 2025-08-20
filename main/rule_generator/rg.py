@@ -23,35 +23,24 @@ prf.FKH_hex.restype = c_int
 kmb_path = os.path.join(current_dir, 'keys', 'kmb.key')
 with open(kmb_path, 'rb') as f:
     kmb = f.read()
-
-K_MB_HEX = kmb.hex() 
+K_MB_HEX = kmb.hex()
 
 # Load fixed point h from file
 h_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'h_fixed.txt'))
 with open(h_path, 'r') as f:
     h_fixed_hex = f.read().strip()
 
-# Example detection rules
+# Example detection rules (sin ID)
 RULES = [
-    {"id": "rule1", "pattern": "ltockens"}
+    {"pattern": "to"}
 ]
 
 def obfuscate_rule_fkh(pattern: str, kmb_hex_str: str, h_fixed_hex: str) -> str:
     """
     Obfuscate a detection rule using the key-homomorphic PRF FKH from C.
-
-    Args:
-        pattern: The rule pattern string (ri).
-        kmb_hex_str: The randomization key kMB as a hex string.
-        h_fixed_hex: The fixed EC point h, in hexadecimal form.
-
-    Returns:
-        The obfuscated rule Ri as a hex string.
+    Returns the obfuscated rule as a hex string.
     """
-    # Normalize pattern to lowercase
     pattern = pattern.lower()
-
-    # Prepare key string: max 16 bytes padded with zeroes
     key_str = pattern.encode("utf-8")
     kmb_hex_bytes = kmb_hex_str.encode("utf-8")
     output_buffer = create_string_buffer(200)
@@ -74,14 +63,6 @@ def split_into_tokens(pattern: str, size: int = 8):
     """
     return [pattern[i:i+size] for i in range(0, len(pattern), size)]
 
-
-def split_into_tokens(pattern: str, size: int = 8):
-    """
-    Split the pattern into fixed-size tokens.
-    """
-    return [pattern[i:i+size] for i in range(0, len(pattern), size)]
-
-
 def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     session_rules = []
     print("[RG] Generating, obfuscating and signing rules...")
@@ -90,27 +71,24 @@ def generate_and_send_rules(mb_url="http://localhost:9999/upload_rules"):
     private_key = load_private_key(os.path.join(current_dir, 'keys', 'rg_private_key.pem'))
 
     for rule in RULES:
-
         # Split the rule into 8-character tokens
         tokens = split_into_tokens(rule["pattern"], 8)
 
+        # IMPORTANTE: desempaquetar enumerate
         for idx, token in enumerate(tokens):
-
             # Obfuscate the detection token using the C PRF (FKH_hex)
             obf_rule = obfuscate_rule_fkh(token, K_MB_HEX, h_fixed_hex)
 
             # Sign the obfuscated rule string using RSA-PSS
-            signature = sign_data(obf_rule, private_key)
+            signature = sign_data(obf_rule, private_key)  # mantiene tu lógica original
 
-            # Append obfuscated rule and signature to the list
+            # Append obfuscated rule and signature to the list (sin rule_id)
             session_rules.append({
-                "rule_id": rule["id"],
-                "token_index": idx,
                 "obfuscated": obf_rule,
                 "signature": signature
             })
 
-            print(f"[RG] Rule {rule['id']} - Token {idx} obfuscated and signed.")
+            print(f"[RG] Token {idx} obfuscated and signed.")
 
     # Send all rules to Middlebox
     try:

@@ -6,7 +6,7 @@ from sympy import symbols
 from sympy.logic.boolalg import to_dnf
 
 # ----------------------------
-# Utilities
+# Utilities (regexes and helpers)
 # ----------------------------
 HEX_WILDCARD_RE = re.compile(r"\?\?")
 HEX_RANGE_RE = re.compile(r"\[(\d+)-(\d+)\]")
@@ -16,46 +16,83 @@ AT_RE      = re.compile(r'\$([A-Za-z0-9_]+)\s+at\s+(\d+)', re.I)
 
 MAGIC_RE = re.compile(r'uint(8|16|32)\s*\(\s*0\s*\)\s*==\s*0x([0-9a-fA-F]+)')
 ID_RE = re.compile(r'\$([A-Za-z0-9_]+)(?!\*)')
+IN_RANGE_RE   = re.compile(r'(\$[A-Za-z0-9_]+)\s+in\s*\(\s*\d+\s*\.\.\s*\d+\s*\)', re.I)
+FILESIZE_RE   = re.compile(r'filesize\s*[<>=!]=?\s*\d+\s*(?:[KMG]?B)?', re.I)
+UINT_EQ_RE    = re.compile(r'uint(?:8|16|32|64)\s*\(\s*\d+\s*\)\s*==\s*0x[0-9a-fA-F]+', re.I)
+COUNT_RE      = re.compile(r'#\s*[A-Za-z0-9_]+\s*[<>=!]=?\s*\d+', re.I)
+THEM_OF_RE = re.compile(r'\b(?:all|any|\d+)\s+of\s+them\b', re.I)
+
+# Literal regexes (specific handling for PDF versions)
+LITERAL_RX = re.compile(r'^/(?:[A-Za-z0-9 _:\.\-]|\\[()\/\\])+/$', re.ASCII)
+PDF_VER_ALT_RX = re.compile(r'^/%PDF-1\\\.\((\d(?:\|\d)+)\)/$')
+PDF_VER_DIGIT_RX = re.compile(r'^/%PDF-1(?:\\\.|\.)\\d\{1\}/$')
+PDF_VER_RANGE_RX = re.compile(r'^/%PDF-1\\\.\[([0-9])\-([0-9])\]/$')
+
+COUNT_CAPTURE_RE = re.compile(r'#\s*([A-Za-z0-9_]+)\s*([><]=?|==)\s*(\d+)', re.I)
 
 
 def clean_string_value(yara_string):
-    """Extract literal text from a quoted YARA string, e.g. '"From:" nocase' -> 'From:'."""
+    """
+    Extracts the literal text from a quoted YARA string.
+    Example: '"From:" nocase' -> 'From:'
+    """
     m = re.match(r'"([^"]*)"', yara_string)
     return m.group(1) if m else yara_string
 
 
+def _preclean_condition(text: str) -> str:
+    """
+    Light pre-clean of YARA condition text:
+      - '$id in (a..b)'  -> keep '$id' (drop the location constraint)
+      - 'uintX(off) == 0x...' -> replaced downstream by a dedicated 'magic' group
+      - 'filesize ...'    -> replaced by True (we don't enforce filesize here)
+    """
+    t = text
+    t = IN_RANGE_RE.sub(r'\1', t)
+    t = UINT_EQ_RE.sub(' $magic ', t)
+    t = FILESIZE_RE.sub(' True ', t)
+    # Compact duplicate whitespace
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
 def extract_group_name(identifier):
     """
-    Extracts the prefix from a YARA string identifier for grouping.
+    Extracts the alphanumeric/underscore prefix from a YARA string identifier
+    to use it as a group name.
     Examples:
       $eml_1 -> 'eml'
       $create0 -> 'create'
-      $97str1 -> 97str
-      $officemagic -> officemagic
+      $97str1 -> '97str'
+      $officemagic -> 'officemagic'
     """
     m = re.match(r"\$([A-Za-z0-9_]+?)(\d*)$", identifier.strip())
     if m:
-        return m.group(1)  # keep the alnum+_ prefix, drop trailing digits
+        return m.group(1)
     return "default_group"
     
 
 def is_hex_with_wildcards_or_gaps(hex_text):
-    """Return True if the hex pattern contains '??' or '[m-n]'."""
+    """Returns True if the hex pattern contains '??' or '[m-n]'."""
     return bool(HEX_WILDCARD_RE.search(hex_text) or HEX_RANGE_RE.search(hex_text))
 
 
 def split_hex_into_tokens(hex_text):
-    """Split { ... } body into tokens (hex bytes, ??, or [m-n])."""
+    """
+    Splits a hex string body '{ ... }' into tokens (hex bytes, '??', or '[m-n]').
+    Returns a list of tokens as strings.
+    """
     body = hex_text.strip()
     if body.startswith("{") and body.endswith("}"):
         body = body[1:-1]
     body = re.sub(r"\s+", " ", body.strip())
     return body.split() if body else []
 
+
 def contiguous_literal_runs(tokens):
     """
-    From token list, extract contiguous literal runs (only hex bytes, no ?? or [m-n]).
-    Returns list of strings like "AA BB CC".
+    From the token list, extracts contiguous literal runs (hex bytes only, i.e., no wildcards or ranges).
+    Returns a list of strings like "AA BB CC".
     """
     runs, buf = [], []
     for t in tokens:
@@ -69,13 +106,14 @@ def contiguous_literal_runs(tokens):
         runs.append(" ".join(buf))
     return runs
 
+
 def derive_sequence_ops(tokens, segment_ids):
     """
-    Given tokens and segment IDs for literal runs, build sequence constraints (ops).
+    Builds sequence constraints (ops) for transitions between literal runs based on wildcards/ranges.
     Mapping:
-      - '??' = ONE_WILDCARD
-      - '[m-n]' = RANGE_m_n
-      - Multiple wildcards/ranges are combined into a single RANGE.
+      - '??'     -> increment gap by exactly 1
+      - '[m-n]'  -> increment gap by range m..n
+    Aggregates consecutive gaps into a single range per transition.
     """
     gaps = []
     current_gap_min = current_gap_max = None
@@ -126,8 +164,12 @@ def derive_sequence_ops(tokens, segment_ids):
             })
     return seqs
 
+
 def is_plain_hex_without_wildcards(value):
-    """True if it's pure hex bytes (no ?? or [m-n]). ex: AB CD AB.."""
+    """
+    Returns True if the value is a pure hex sequence (no '??' or '[m-n]').
+    Accepts either '{AA BB}' or 'AA BB' format.
+    """
     val = value.strip()
     val = val[1:-1] if val.startswith("{") and val.endswith("}") else val
     if HEX_WILDCARD_RE.search(val) or HEX_RANGE_RE.search(val):
@@ -135,131 +177,284 @@ def is_plain_hex_without_wildcards(value):
     toks = re.split(r"\s+", val.strip()) if val.strip() else []
     return all(re.fullmatch(r"[0-9A-Fa-f]{2}", t) for t in toks) and len(toks) > 0
 
+
 def is_numeric_matchtype(mt: str) -> bool:
-    """Return True if match_type is a numeric string like '14'."""
+    """Returns True if match_type is a numeric string like '14'."""
     return bool(re.fullmatch(r"\d+", str(mt).strip()))
 
 
 def _add_simple(groups_simple, gname, val, dt):
+    """
+    Adds a simple (non-chained) item into a prefix-based group.
+    For hex, normalizes spacing; for strings, keeps as-is.
+    Stores items as dicts with {'value', 'data_type'} and tracks types in '_types'.
+    """
     g = groups_simple.setdefault(gname, {"match_type": "all", "strings": [], "_types": set()})
-    # normalize hex/text spacing
     if dt == "hex":
         val = re.sub(r"\s+", " ", val.strip())
-    else:
-        val = val  # keep as-is for text
     g["strings"].append({"value": val, "data_type": dt})
     g["_types"].add(dt)
 
+
 def _hex_le_bytes(value_hex: str, bits: int) -> str:
-    """Devuelve string 'AA BB ...' en little-endian para el valor y tamaño indicado."""
+    """
+    Converts a numeric hex literal into a little-endian byte sequence string 'AA BB ...'
+    for a given width (8/16/32 bits).
+    """
     v = int(value_hex, 16)
     nbytes = {8:1, 16:2, 32:4}[bits]
     b = [(v >> (8*i)) & 0xFF for i in range(nbytes)]  # little-endian
     return " ".join(f"{x:02X}" for x in b)
 
+
 def inject_magic_group(simple_groups: dict, cond_text: str):
     """
-    Si hay tests de cabecera (uintX(0) == 0xNN...), añade grupo 'magic'
-    con match_type='all' y data_type='hex'. Acumula varias comparaciones.
+    If the condition contains tests like 'uintX(0) == 0xNN...', create/update group 'magic'
+    (match_type='all', data_type='hex') and add the corresponding byte sequences.
     """
     matches = list(MAGIC_RE.finditer(cond_text))
     if not matches:
         return
 
-    # crea o reutiliza el grupo
     g = simple_groups.setdefault("magic", {"match_type":"all", "strings":[], "_types": set()})
-
     for m in matches:
         bits = int(m.group(1))
         hx   = m.group(2)
         val  = _hex_le_bytes(hx, bits)
-        # evita duplicados exactos
         if not any(s["value"] == val and s["data_type"] == "hex" for s in g["strings"]):
             g["strings"].append({"value": val, "data_type": "hex"})
             g["_types"].add("hex")
 
-#--------------------------------
-#INTENTO 2
-#-----------------------------
 
+# ----------------------------
+# NEW helpers for count-as-repetition (your requested behavior)
+# ----------------------------
+
+def _all_items_are_short_strings(gdata: dict, max_len: int = 8) -> bool:
+    """
+    Returns True if ALL items in the group are text strings (data_type='string')
+    and each has length < max_len. If mixed types (hex) or any string >= max_len,
+    returns False.
+    """
+    for it in gdata["strings"]:
+        if isinstance(it, dict):
+            val, dt = it.get("value", ""), it.get("data_type", "string")
+        else:
+            val, dt = it, "string"
+        if dt != "string" or len(val) >= max_len:
+            return False
+    return True
+
+
+def _repeat_value(val: str, dt: str, times: int) -> str:
+    """
+    Repeats the literal N times. We only apply this to text strings by policy.
+    For hex items, we keep the value as-is (no repetition) in this mode.
+    """
+    if dt == "hex":
+        return val  # do NOT repeat hex here; repetition is only for short strings
+    return val * times
+
+
+def _apply_count_as_repetition_short_strings(gdata: dict, times: int, max_len: int = 8):
+    """
+    Replaces ONLY short text strings (len < max_len) by their N-times repeated value.
+    Keeps other items untouched. Recomputes '_types'.
+    """
+    new_items, new_types = [], set()
+    for it in gdata["strings"]:
+        if isinstance(it, dict):
+            val, dt = it["value"], it["data_type"]
+        else:
+            val, dt = it, "string"
+
+        if dt == "string" and len(val) < max_len:
+            new_val = _repeat_value(val, dt, times)
+            new_items.append({"value": new_val, "data_type": dt})
+        else:
+            new_items.append({"value": val, "data_type": dt})
+        new_types.add(dt)
+
+    gdata["strings"] = new_items
+    gdata["_types"] = new_types
+
+
+# ----------------------------
+# Leaves / boolean condition processing
+# ----------------------------
 def _extract_leaves_for_groups(cond_text: str):
-    """Devuelve lista de (span, group_name) desde hojas tipo 'any/all/N of ($pref*)' o '$id at N'."""
+    """
+    Extracts references used to infer grouping in conditions:
+      - any/all/N of ($pref*)
+      - $id at N
+      - $id (simple, without asterisk)
+      - '#id op N' counters
+      - 'all of them'
+    Returns a list of (span, group_name).
+    """
     leaves = []
+    taken = []  # spans already occupied by higher-priority matches
+
+    # 1) any/all/N of ($pref*)
     for m in LEAF_OF_RE.finditer(cond_text):
         pref = m.group(2)
-        leaves.append((m.span(), pref))
+        sp = m.span()
+        leaves.append((sp, pref))
+        taken.append(sp)
+
+    # 2) $id at N
     for m in AT_RE.finditer(cond_text):
-        pref = m.group(1)
-        # Si quieres preservar el anclaje, guarda también pos=m.group(2) y crea una hoja anchor_at
-        leaves.append((m.span(), pref))
+        pref = extract_group_name(f"${m.group(1)}") 
+        sp = m.span()
+        leaves.append((sp, pref))
+        taken.append(sp)
+
+    # 3) $id simple (no '*'), but skip those inside previous spans
+    for m in ID_RE.finditer(cond_text):
+        sp = m.span()
+        if any(sp[0] >= a and sp[1] <= b for (a, b) in taken):
+            continue
+        pref = extract_group_name(f"${m.group(1)}")
+        leaves.append((sp, pref))
+
+    # 4) #id op N counts
+    for m in COUNT_CAPTURE_RE.finditer(cond_text):
+        sp = m.span()
+        if any(sp[0] >= a and sp[1] <= b for (a, b) in taken):
+            continue
+        pref = extract_group_name(f"${m.group(1)}")
+        leaves.append((sp, pref))
+        taken.append(sp)
+
+    # 5) 'all of them'
+    for m in THEM_OF_RE.finditer(cond_text):
+        sp = m.span()
+        if any(sp[0] >= a and sp[1] <= b for (a, b) in taken):
+            continue
+        txt = m.group(0).lower()
+        if txt.startswith("all"):
+            leaves.append((sp, "__THEM_ALL__"))
+            taken.append(sp)
+
     leaves.sort(key=lambda x: x[0][0])
     return leaves
 
+
 def _tokenize_to_bool(cond_text: str):
+    """
+    Replaces group references by symbols Xk and returns a boolean expression string
+    plus the mapping symbol -> group name. Also normalizes AND/OR/NOT.
+    """
+    cond_text = _preclean_condition(cond_text) 
     leaves = _extract_leaves_for_groups(cond_text)
     mapping, out, i, k = {}, [], 0, 0
     for (s,e), g in leaves:
         out.append(cond_text[i:s])
         sym = f"X{k}"
-        mapping[sym] = g  # g = group name
+        mapping[sym] = g
         out.append(sym)
         i = e; k += 1
     out.append(cond_text[i:])
     expr = "".join(out)
-    # Normaliza operadores booleanos
     expr = re.sub(r'\bAND\b', ' & ', expr, flags=re.I)
     expr = re.sub(r'\bOR\b',  ' | ', expr, flags=re.I)
-    expr = re.sub(r'\bNOT\b', ' ~ ', expr, flags=re.I)  # por si apareciera
+    expr = re.sub(r'\bNOT\b', ' ~ ', expr, flags=re.I)
     expr = re.sub(r'\s+', ' ', expr).strip()
     return expr, mapping
 
-def condition_to_or_of_group_ands(cond_text: str):
+
+def condition_to_or_of_group_ands(cond_text: str, all_groups: list[str]):
     """
-    Devuelve un dict de la forma:
-    { "or": [ { "groups":[...], "operator":"and" }, ... ] }
+    Converts the YARA condition into a normalized JSON logic:
+      - Plain AND: {"groups":[...], "operator":"and"}
+      - OR of ANDs: {"or":[ {"groups":[...], "operator":"and"}, ... ]}
+      - With NOT: wrap negatives as {"groups":[...], "operator":"not"} or {"and":[...]}
+      - 'all of them' expands to all currently known simple groups.
     """
     expr, mapping = _tokenize_to_bool(cond_text)
     if not mapping:
-        return None  # no se detectaron hojas compatibles
-    # Prepara símbolos para sympy
+        return None
+
     syms = {s: symbols(s) for s in mapping}
-    # Eval segura: sólo símbolos Xk y &,|,~,(), espacios
     safe = expr
     for s in syms:
         safe = safe.replace(s, f"syms['{s}']")
     dnf = to_dnf(eval(safe), simplify=True)
 
-    def clause_to_groups(cl):
-        # cl puede ser un símbolo único o una conjunción And(...)
-        if getattr(cl, "is_Symbol", False):
-            return [mapping[str(cl)]]
-        # And(...)
-        seen, ordered = set(), []
-        for arg in cl.args:
-            g = mapping[str(arg)]
+    def split_pos_neg_from_clause(clause):
+        """
+        Splits a DNF clause into positive and negative group lists.
+        """
+        pos, neg = [], []
+
+        def add_lit(lit):
+            if getattr(lit, "is_Symbol", False):
+                pos.append(mapping[str(lit)])
+            elif getattr(lit, "func", None).__name__ == "Not":
+                sym = lit.args[0]
+                neg.append(mapping[str(sym)])
+
+        if getattr(clause, "is_Symbol", False) or getattr(clause, "func", None).__name__ == "Not":
+            add_lit(clause)
+        elif getattr(clause, "func", None).__name__ == "And":
+            for arg in clause.args:
+                add_lit(arg)
+
+        # De-duplicate while preserving order
+        def dedup(xs):
+            seen, out = set(), []
+            for g in xs:
+                if g not in seen:
+                    seen.add(g); out.append(g)
+            return out
+
+        return dedup(pos), dedup(neg)
+
+    def _expand_specials(names: list[str]) -> list[str]:
+        out = []
+        for g in names:
+            if g == "__THEM_ALL__":
+                out.extend(all_groups)
+            else:
+                out.append(g)
+        seen, ded = set(), []
+        for g in out:
             if g not in seen:
-                seen.add(g); ordered.append(g)
-        # And: recopila todos los símbolos dentro
-        return ordered
+                seen.add(g); ded.append(g)
+        return ded
 
-    # Convierte DNF a lista de bloques AND
-    # Construye bloques (OR de ANDs en general)
-    if dnf.func.__name__ == 'Or':
-        blocks = [clause_to_groups(arg) for arg in dnf.args]
+    def block_to_node(pos, neg):
+        """Builds a JSON node for one AND block with positives and/or negatives."""
+        pos = _expand_specials(pos)
+        nodes = []
+        if pos:
+            nodes.append({"groups": pos, "operator": "and"})
+        if neg:
+            nodes.append({"groups": neg, "operator": "not"})
+        if not nodes:
+            return {"groups": [], "operator": "and"}  # Edge case
+        if len(nodes) == 1:
+            return nodes[0]
+        return {"and": nodes}
+
+    if dnf.func.__name__ == "Or":
+        blocks = [block_to_node(*split_pos_neg_from_clause(arg)) for arg in dnf.args]
+        return {"or": blocks}
     else:
-        blocks = [clause_to_groups(dnf)]
+        pos, neg = split_pos_neg_from_clause(dnf)
+        node = block_to_node(pos, neg)
+        return node
 
-    # 🔧 FIX: si solo hay UN bloque, devuelve un AND plano (sin "or")
-    if len(blocks) == 1:
-        return {"groups": blocks[0], "operator": "and"}
-
-    # Si hay varios bloques, sí usa "or"
-    return {"or": [ {"groups": g, "operator": "and"} for g in blocks ]}
 
 # ----------------------------
 # Main conversion
 # ----------------------------
 def yara_to_default_dict(yara_path: str) -> dict:
+    """
+    Parses a YARA file and emits a normalized dict with:
+      - groups: prefix-based simple groups and 'cadena' chain groups for hex with gaps
+      - conditions: logical structure referencing groups and/or sequence constraints
+    """
     y = yaramod.Yaramod(yaramod.Features.AllCurrent)
     yr_file = y.parse_file(yara_path)
 
@@ -269,11 +464,12 @@ def yara_to_default_dict(yara_path: str) -> dict:
         rule_out = {"groups": {}, "conditions": []}
 
         # Containers
-        simple_groups = {}   # prefix-based groups for plain strings/hex
+        simple_groups = {}   # prefix groups for plain strings/hex
         chain_groups = []    # list of {group_name, strings:[{id,value}], seqs:[{from,to,op}]}
         chain_counter = 0
+        skip_rule = False   
 
-        # Collect strings
+        # Collect strings/hex/regex from the rule
         for s in rule.strings:
             if s.is_plain:
                 # Plain text string
@@ -287,10 +483,10 @@ def yara_to_default_dict(yara_path: str) -> dict:
                 tokens = split_hex_into_tokens(raw)
 
                 if is_hex_with_wildcards_or_gaps(raw):
-                    # Hex with wildcards/gaps -> build a "cadena" group with IDs and sequences in conditions
+                    # Hex with wildcards/ranges -> create a chain group with literal runs and sequence ops
                     runs = contiguous_literal_runs(tokens)
                     if not runs:
-                        # Ignore fully-wildcard patterns (rare)
+                        # Fully wildcard pattern: ignore (rare)
                         continue
                     group_name = f"group{chain_counter}"
                     chain_counter += 1
@@ -305,20 +501,122 @@ def yara_to_default_dict(yara_path: str) -> dict:
                     chain_groups.append({"group_name": group_name, "strings": strings_list, "seqs": seqs})
 
                 else:
-                    # Pure hex without wildcards -> treat as a plain group by prefix
+                    # Pure hex without wildcards -> treat as a simple group (by prefix)
                     val = raw.strip()
                     val = val[1:-1] if val.startswith("{") and val.endswith("}") else val
                     gname = extract_group_name(s.identifier)
                     _add_simple(simple_groups, gname, val, "hex")
+            
+            elif getattr(s, "is_regexp", False):
+                raw = s.text.strip()
 
+                # 2.1) PDF headers with numeric alternatives: /%PDF-1\.(3|4|6)/
+                m_ver = PDF_VER_ALT_RX.match(raw)
+                if m_ver:
+                    nums = m_ver.group(1).split('|')              # ["3","4","6"]
+                    values = [f"%PDF-1.{n}" for n in nums]        # ["%PDF-1.3", ...]
+                    gname = extract_group_name(s.identifier)      # usually "ver" or similar
+                    g = simple_groups.setdefault(gname, {"match_type":"all", "strings":[], "_types": set()})
+                    for v in values:
+                        if not any(it["value"] == v and it["data_type"] == "string" for it in g["strings"]):
+                            g["strings"].append({"value": v, "data_type": "string"})
+                            g["_types"].add("string")
+                    # Force 'any' for version alternatives
+                    g["match_type"] = "any"
+                    g["_forced_match"] = True
+                    continue
+
+                # 2.1b) PDF with a single version digit: /%PDF-1\.\d{1}/
+                if PDF_VER_DIGIT_RX.match(raw):
+                    values = [f"%PDF-1.{d}" for d in range(10)]  # 1.0 .. 1.9
+                    gname = extract_group_name(s.identifier)
+                    g = simple_groups.setdefault(gname, {"match_type":"all","strings":[],"_types":set()})
+                    for v in values:
+                        if not any(it["value"]==v and it["data_type"]=="string" for it in g["strings"]):
+                            g["strings"].append({"value": v, "data_type": "string"})
+                            g["_types"].add("string")
+                    g["match_type"] = "any"
+                    g["_forced_match"] = True
+                    continue
+
+                # 2.1c) PDF with version range: /%PDF-1\.[3-7]/
+                m_rng = PDF_VER_RANGE_RX.match(raw)
+                if m_rng:
+                    lo = int(m_rng.group(1))
+                    hi = int(m_rng.group(2))
+                    values = [f"%PDF-1.{d}" for d in range(lo, hi+1)]
+                    gname = extract_group_name(s.identifier)
+                    g = simple_groups.setdefault(gname, {"match_type":"all", "strings":[], "_types": set()})
+                    for v in values:
+                        if not any(it["value"] == v and it["data_type"] == "string" for it in g["strings"]):
+                            g["strings"].append({"value": v, "data_type": "string"})
+                            g["_types"].add("string")
+                    g["match_type"] = "any"
+                    g["_forced_match"] = True
+                    continue
+
+                # 2.2) Regex that is actually a literal -> treat as plain string
+                if LITERAL_RX.match(raw):
+                    body = raw[1:-1]                 # strip /…/
+                    body = (body
+                        .replace(r"\/", "/")
+                        .replace(r"\(", "(")
+                        .replace(r"\)", ")")
+                        .replace(r"\\", "\\"))
+                    gname = extract_group_name(s.identifier)
+                    _add_simple(simple_groups, gname, body, "string")
+                    continue
+
+                # 2.3) Unsupported regex -> skip whole rule (conservative)
+                skip_rule = True
+                break
             else:
-                # You can extend here for regex, wide, nocase, etc.
                 continue
 
-        # Deduce match_type for simple groups from the YARA rule condition
+        if skip_rule:
+            continue  
+
+        # Deduce match_type for simple groups from the YARA condition text
         cond_text = rule.condition.text.lower() if rule.condition else ""
         inject_magic_group(simple_groups, cond_text)
+
         for gname in list(simple_groups.keys()):
+            # Honor forced 'any' (e.g., PDF versions)
+            if simple_groups[gname].get("_forced_match"):
+                continue
+
+            # Detect "N of ($gname*)"
+            n_of_group_pat = re.compile(rf'\b(\d+)\s+of\s*\(\s*\${re.escape(gname)}\*', re.IGNORECASE)
+            mN = n_of_group_pat.search(cond_text)
+            if mN:
+                simple_groups[gname]["match_type"] = mN.group(1)  # e.g., "2"
+                continue
+
+            # Detect "#gname op N" counters
+            count_pat = re.compile(rf'#\s*{re.escape(gname)}\s*([><]=?|==)\s*(\d+)', re.IGNORECASE)
+            mcount = count_pat.search(cond_text)
+            if mcount:
+                op = mcount.group(1)   # operator: ">", ">=", "==", "<", etc.
+                N  = int(mcount.group(2))
+
+                # Requested policy:
+                # - If ALL items are text strings and each has length < 8:
+                #       repeat the literal N times and set match_type = "1".
+                # - Else:
+                #       keep match_type = N and keep original strings untouched.
+                if _all_items_are_short_strings(simple_groups[gname], max_len=8):
+                    repeat = N  # For "#shell > 10" you asked for "A * 10" with match_type "1".
+                                 # If you want strict '>' semantics, use N+1 here instead.
+                    _apply_count_as_repetition_short_strings(simple_groups[gname], repeat, max_len=8)
+                    simple_groups[gname]["match_type"] = "1"
+                    simple_groups[gname]["_count_as_repeat"] = {"op": op, "N": N, "repeat": repeat}
+                else:
+                    simple_groups[gname]["match_type"] = str(N)
+                    simple_groups[gname]["_count_kept_numeric"] = {"op": op, "N": N, "reason": "not all short strings"}
+
+                continue
+
+            # Default deduction for "all/any of ($gname*)", or fallback to 'all'
             all_pat = re.compile(rf"\ball of\s*\(\s*\${gname}\*", re.IGNORECASE)
             any_pat = re.compile(rf"\bany of\s*\(\s*\${gname}\*", re.IGNORECASE)
             n_of_them_pat = re.compile(r"\b(\d+)\s+of\s+them\b", re.IGNORECASE)
@@ -330,7 +628,6 @@ def yara_to_default_dict(yara_path: str) -> dict:
             else:
                 m = n_of_them_pat.search(cond_text)
                 if m:
-                    # In your model, numeric means "at least N"
                     simple_groups[gname]["match_type"] = m.group(1)
                 else:
                     simple_groups[gname]["match_type"] = "all"
@@ -342,7 +639,7 @@ def yara_to_default_dict(yara_path: str) -> dict:
                 "data_type": "hex",
                 "strings": cg["strings"]
             }
-            # Sequences go ONLY under conditions, referencing IDs (no hex repetition)
+            # Sequence constraints go under conditions, referencing string IDs
             for seq in cg["seqs"]:
                 rule_out["conditions"].append({
                     "sequence": {
@@ -359,40 +656,36 @@ def yara_to_default_dict(yara_path: str) -> dict:
             items = gdata["strings"]
 
             if len(types) <= 1:
-                # homogeneous -> keep legacy shape if quieres (solo valores) o ya per-item
+                # Homogeneous type -> keep legacy shape (values only) if desired
                 only_type = next(iter(types)) if types else "string"
                 rule_out["groups"][gname] = {
                     "match_type": gdata["match_type"],
                     "data_type": only_type,
-                    "strings": [it["value"] for it in items]  # <- legacy list of values
-                    # si prefieres TODO per-item siempre, cambia por: "strings": items
+                    "strings": [it["value"] for it in items]  # legacy list of values
                 }
             else:
-                # mixed -> per-item data_type
+                # Mixed types -> keep per-item objects with data_type
                 rule_out["groups"][gname] = {
                     "match_type": gdata["match_type"],
                     "data_type": "mixed",
                     "strings": items  # [{ "value":..., "data_type":... }, ...]
                 }
 
-        # Build logical conditions:
-
-        # ----nested boolean logic directly from the YARA condition AST
-        
-        logic_node = condition_to_or_of_group_ands(rule.condition.text) if rule.condition else None
-
+        # Build logical conditions node from YARA condition AST
+        logic_node = condition_to_or_of_group_ands(rule.condition.text, list(simple_groups.keys())) if rule.condition else None
         if logic_node:
             rule_out["conditions"].append(logic_node)
         else:
+            # Fallback: AND of all simple groups if no condition was found
             all_simple = list(simple_groups.keys())
             if all_simple:
                 rule_out["conditions"].append({"groups": all_simple, "operator": "and"})
-
 
         # Store this rule
         result[rule.name] = rule_out
 
     return result
+
 
 # ----------------------------
 # Run conversion for a file
@@ -400,7 +693,12 @@ def yara_to_default_dict(yara_path: str) -> dict:
 if __name__ == "__main__":
     # Adjust this path to your YARA file
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    yara_path = os.path.join(script_dir, "YARA", "Maldoc_PDF.yar")
+    yara_path = os.path.join(script_dir, "YARA", "extortion_email.yar")
 
     out = yara_to_default_dict(yara_path)
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+    # Write result to JSON near this script
+    out_path = os.path.join(script_dir, "diccioner.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f"[OK] Wrote JSON to: {out_path}")
