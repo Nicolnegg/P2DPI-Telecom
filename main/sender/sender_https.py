@@ -1,10 +1,27 @@
 # sender/sender_https.py
+#
+# Purpose:
+#   Proxy incoming client traffic, extract tokens in a deterministic way
+#   (normalized sliding-8 + canonical tokens), encrypt them, send to MB,
+#   and then forward the original request to the receiver.
+#
+# Important:
+#   - Ensure encrypt_tokens DOES NOT lowercase or re-decode tokens; they arrive as bytes, already normalized.
 
 from flask import Flask, request, Response
 import requests
 import random
-from sender_utils import extract_tokens_sliding_window, encrypt_tokens, load_ksr_from_file
 import os
+
+# New: import the orchestrator helpers instead of direct sliding window
+from sender_utils import (
+    normalize_view,           # bytes -> bytes (canonical view)
+    emit_sliding8,            # bytes -> list[(offset:int, token8:bytes)]
+    emit_canonical_tokens,    # bytes -> list[(offset:int, token8:bytes)]
+    merge_tokens,             # (view, sliding, canon) -> list[bytes] in deterministic order (dedup per offset)
+    encrypt_tokens,           # same signature as before; must NOT lowercase/decode internally
+    load_ksr_from_file
+)
 
 app = Flask(__name__)
 
@@ -17,49 +34,66 @@ SENDER_KEY = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "private",
 # === URL of the receiver service ===
 RECEIVER_URL = "https://receiver.p2dpi.local:10443/"
 
+# Debug flags (optional)
+DEBUG_PRINT_TOKENS = True
+DEBUG_PRINT_ENCRYPTED = False
+
+
 @app.route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def proxy():
     print("=== Incoming client request ===")
 
-    # === Get raw request payload ===
+    # Raw payload as bytes
     payload = request.get_data()
 
-    # === Extract and encrypt tokens ===
+    content_type = (request.headers.get("Content-Type") or "").lower()
+    if "application/x-www-form-urlencoded" in content_type:
+        # En forms, '+' representa espacio. Antes de URL-decode, pásalo a 0x20.
+        payload = payload.replace(b"+", b" ")
+
     try:
-        tokens = extract_tokens_sliding_window(payload)  # Extract tokens using sliding window
-        
-        # BORRAR ESTO Imprime tokens extraídos en hex para debug
-        for token in tokens:
-            print(f"Token: {token.hex()} - ASCII: {token.decode(errors='ignore')}")
+        # 1) Build canonical view: ASCII lowercase + intra-line whitespace collapse (+ optional URL-decode)
+        view = normalize_view(payload)
 
-        
-        kSR = load_ksr_from_file()  # Load shared secret key between Sender and Receiver
-        counter = random.randint(0, 2**32 - 1)  # Random nonce/counter for PRF
+        # 2) Sliding-8 tokens over the canonical view (offset, token8)
+        sliding = emit_sliding8(view)
+
+        # 3) Canonical tokens (offset, token8) — header names, short words, name=, and /name
+        canonical = emit_canonical_tokens(view)
+
+        # 4) Merge both sets into a single, deterministic sequence of token bytes.
+        #    Deduplicate per offset: if a canonical token equals view[offset:offset+8], skip it.
+        tokens = merge_tokens(view, sliding, canonical)
+
+        if DEBUG_PRINT_TOKENS:
+            for i, tok in enumerate(tokens):
+                try_ascii = tok.decode("ascii", errors="ignore")
+                print(f"[TOK{i:04d}] {tok.hex()}  |  ASCII: {try_ascii!r}")
+
+        # 5) Encrypt tokens with current counter
+        kSR = load_ksr_from_file()              # shared S↔R secret
+        counter = random.randint(0, 2**32 - 1)  # nonce/counter for PRF
         encrypted_tokens = encrypt_tokens(tokens, kSR, counter=counter)
-        
-        print(f"Counter used: {counter}")
-        print("Encrypted tokens:")
-        for t in encrypted_tokens:
-            print(t.hex()) 
 
-        # Send encrypted_tokens to the Middlebox 
+        if DEBUG_PRINT_ENCRYPTED:
+            print(f"Counter used: {counter}")
+            for i, ct in enumerate(encrypted_tokens):
+                print(f"[CT{i:04d}] {ct.hex()}")
+
+        # 6) Send encrypted tokens to the Middlebox
         tokens_hex = [t.hex() for t in encrypted_tokens]
         counter_hex = counter.to_bytes(4, "big").hex()
-
 
         mb_url = "http://localhost:9999/receive_tokens"
         try:
             mb_response = requests.post(
                 mb_url,
-                json={
-                    "encrypted_tokens": tokens_hex,
-                    "c": counter_hex
-                },
+                json={"encrypted_tokens": tokens_hex, "c": counter_hex},
                 timeout=3
             )
-            print(f"Sent tokens to mb, response status: {mb_response.status_code}")
-            
-            # === Check MB verdict ===
+            print(f"Sent tokens to MB, response status: {mb_response.status_code}")
+
+            # MB verdict: non-200 => block, or status != ok => block
             if mb_response.status_code != 200:
                 print("MB responded with error, blocking request.")
                 return Response("Blocked by middlebox", status=403)
@@ -77,18 +111,17 @@ def proxy():
         print("Error in token processing:", e)
         return Response("Token processing error", status=500)
 
-     # === Forward structured request to Receiver ===
+    # === Forward the original request to the receiver (unchanged app logic) ===
     try:
-        # Encapsulate data to send to receiver
         structured_payload = {
-            "tokens": [t.hex() for t in tokens], #traffic without encription
+            # NOTE: we send the final 8-byte tokens (plain) only for debugging at the receiver
+            "tokens": [t.hex() for t in tokens],
             "counter": counter_hex,
-            "payload": payload.hex(),  # send raw payload in hex string
+            "payload": payload.hex(),          # raw original payload for the receiver
             "headers": dict(request.headers),
             "method": request.method
         }
 
-        # Send JSON to receiver
         resp = requests.post(
             url=RECEIVER_URL,
             json=structured_payload,
@@ -96,10 +129,10 @@ def proxy():
             timeout=10
         )
 
-        # Prepare response to send back to the client
+        # Build response to the client
         response = Response(resp.content, status=resp.status_code)
 
-        # Copy back relevant headers (skip hop-by-hop headers)
+        # Copy back non hop-by-hop headers
         excluded_headers = ['content-encoding', 'transfer-encoding', 'connection']
         for key, value in resp.headers.items():
             if key.lower() not in excluded_headers:
@@ -110,20 +143,18 @@ def proxy():
     except Exception as e:
         print("Forwarding failed:", e)
         return Response("Forwarding error", status=502)
-    
-#==Change this payload for test
+
+
+# Local helper endpoint to trigger a test POST (unchanged)
 @app.route("/send_test_data", methods=["GET"])
 def trigger_test_client_request():
-    """
-    Simulates a client request from inside the sender, manually triggered.
-    """
+    #BORRAR
     import requests
-
     data = {
         "username": "alice",
-        "password": "to: Nicol"
+        "password": "Nicol",
+        "pdf_hint": "%PDF-1.4 lorem ipsum"
     }
-
     try:
         response = requests.post(
             "https://sender.p2dpi.local:8443/",
@@ -131,14 +162,13 @@ def trigger_test_client_request():
             verify=CA_CERT_PATH
         )
         return f"[LOCAL CLIENT] POST response: {response.text}", response.status_code
-
     except Exception as e:
         return f"[LOCAL CLIENT] Error: {str(e)}", 500
 
-# === Run HTTPS server with Flask SSL context ===
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=8443,
-        ssl_context=(SENDER_CERT, SENDER_KEY)  # TLS server identity for client
+        ssl_context=(SENDER_CERT, SENDER_KEY)
     )

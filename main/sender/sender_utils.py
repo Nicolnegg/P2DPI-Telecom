@@ -5,15 +5,26 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 from ctypes import CDLL, c_char_p, c_int, create_string_buffer, c_ubyte, POINTER
+from typing import List, Tuple
+from urllib.parse import unquote_to_bytes
+
 
 import struct
 import os
 import base64
 import logging
 import hashlib
+import re
 
 BUFFER_SIZE = 200
 TOKEN_WINDOW_SIZE = 8
+
+# Optional feature flags (tweak as needed)
+ENABLE_URL_DECODE = True      # set True if you want URL-decode ALL %xx sequences
+ENABLE_CANON_HEADERS = True
+ENABLE_CANON_WORDS = True
+ENABLE_CANON_NAMEEQ = True
+ENABLE_CANON_SLASHNAME = True
 
 # === Load PRF library (FKH_hex) from shared C code ===
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +38,9 @@ prf.FKH_hex.restype = c_int
 prf.H2.argtypes = [POINTER(c_ubyte), c_int, POINTER(c_ubyte), POINTER(c_ubyte)]
 prf.H2.restype = c_int
 
+prf.EC_POINT_exp_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
+prf.EC_POINT_exp_hex.restype  = c_int
+
 # === Load fixed session point h from file ===
 h_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'h_fixed.txt'))
 with open(h_path, 'r') as f:
@@ -34,7 +48,6 @@ with open(h_path, 'r') as f:
 
 # === Path to stored kSR key file ===
 ksr_path = os.path.abspath(os.path.join(current_dir, "keys", "shared_ksr.key"))
-
 
 def extract_tokens_sliding_window(payload: bytes, window_size=TOKEN_WINDOW_SIZE):
     """
@@ -60,9 +73,6 @@ def encrypt_tokens(tokens, kSR_hex, counter):
     encrypted_tokens = []
 
     for i, token_bytes in enumerate(tokens):
-        # Normalize the token to lowercase
-        token_bytes = token_bytes.decode(errors="ignore").lower().encode()
-        
         # Compute (g^{H1(ti)} * h)^{kSR} using FKH_hex
 
         # pass raw token bytes (not hex ASCII). C expects up to 16 raw bytes.
@@ -97,7 +107,7 @@ def encrypt_tokens(tokens, kSR_hex, counter):
         output_h2 = (c_ubyte * 16)()
         success = prf.H2(y_cbytes, 16, h2_key, output_h2)
         if success != 1:
-            raise RuntimeError(f"H2 encryption failed for token {token_hex}")
+            raise RuntimeError(f"H2 encryption failed for token {i}")
 
         # Append encrypted token bytes to result list
         encrypted_tokens.append(bytes(output_h2))
@@ -156,3 +166,172 @@ def load_ksr_from_file():
         raise FileNotFoundError(f"kSR key file not found: {ksr_path}")
     with open(ksr_path, "r") as f:
         return f.read().strip()
+    
+
+def _ascii_lower(b: int) -> int:
+    """Lowercase only ASCII A..Z; leave all other bytes unchanged."""
+    return b + 32 if 65 <= b <= 90 else b
+
+
+def _url_decode_all(data: bytes) -> bytes:
+
+    return unquote_to_bytes(data.decode('latin-1', errors='ignore'))
+
+def normalize_view(payload: bytes) -> bytes:
+    """
+    Build the canonical view of the payload:
+      1) ASCII lowercase (A..Z -> a..z) only
+      2)  URL-decode ALL %xx sequences
+      3) Collapse spaces/tabs within a line into a single space (preserve CRLF)
+    """
+    lowered = bytes(_ascii_lower(b) for b in payload)
+    if ENABLE_URL_DECODE:
+        lowered = _url_decode_all(lowered)
+    collapsed = _collapse_spaces_in_line(lowered)
+    return collapsed
+
+def _collapse_spaces_in_line(data: bytes) -> bytes:
+    """
+    Collapse consecutive spaces/tabs within the same line into a single space (0x20).
+    Preserve CRLF bytes as-is and reset collapsing after each newline.
+    """
+    out = bytearray()
+    in_space = False
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b in (0x0D, 0x0A):  # CR or LF: reset space state and pass through
+            out.append(b)
+            in_space = False
+        elif b in (0x20, 0x09):  # space or tab
+            if not in_space:
+                out.append(0x20)  # write a single space
+                in_space = True
+            # else: skip additional spaces/tabs
+        else:
+            out.append(b)
+            in_space = False
+        i += 1
+    return bytes(out)
+
+
+def emit_sliding8(view: bytes, size: int = TOKEN_WINDOW_SIZE) -> List[Tuple[int, bytes]]:
+    """
+    Emit all contiguous windows of 'size' bytes from the canonical view.
+    Returns a list of (offset, token8).
+    """
+    n = len(view)
+    if n < size:
+        return []
+    return [(i, view[i:i+size]) for i in range(n - size + 1)]
+
+
+def _pad_to_8(b: bytes) -> bytes:
+    """Pad with ASCII spaces to reach exactly 8 bytes (no truncation here)."""
+    if len(b) >= 8:
+        return b[:8]
+    return b + b" " * (8 - len(b))
+
+
+def emit_canonical_tokens(view: bytes) -> List[Tuple[int, bytes]]:
+    """
+    Canonical tokens (rule-agnostic) that preserve punctuation when relevant:
+      - Inline labels:   "<name>:"  -> "<name>: "  (padded to 8)
+      - name=:           "<name>="  -> "<name>="   (padded to 8)
+      - /name:           "/<name>"  -> "/<name> "  (padded to 8)
+      - Short words:     "<word>"   -> "<word>"    (padded), BUT ONLY if next char is NOT ':' or '='
+    """
+    out: List[Tuple[int, bytes]] = []
+    text = view.decode("latin-1", errors="ignore")
+    n = len(text)
+
+    def _pad_to_8(b: bytes) -> bytes:
+        return b[:8] if len(b) >= 8 else b + b" " * (8 - len(b))
+
+    # A) Inline labels ANYWHERE: ([a-z0-9_-]{1,15}):
+    #    Prefer adding a single space after ':' when it fits (more robust).
+    for m in re.finditer(r"([a-z0-9_-]{1,15}):", text):
+        name = m.group(1)
+        start = m.start(1)
+        base = (name + ":").encode("latin-1")
+        token = _pad_to_8(base + (b" " if len(base) < 8 else b""))
+        out.append((start, token))
+
+    # B) name= ANYWHERE (you already had this)
+    for m in re.finditer(r"\b([a-z0-9_]{1,7})=", text):
+        name = m.group(1)
+        start = m.start(1)
+        base = (name + "=").encode("latin-1")
+        token = _pad_to_8(base)
+        out.append((start, token))
+
+    # C) /name ANYWHERE (you already had this)
+    for m in re.finditer(r"/([a-z0-9_]{1,7})\b", text):
+        name = m.group(1)
+        start = m.start(0)  # include '/'
+        base = ("/" + name).encode("latin-1")
+        token = _pad_to_8(base + (b" " if len(base) < 8 else b""))
+        out.append((start, token))
+
+    # D) Short words, but SKIP if followed by ':' or '=' (so we don't drop punctuation)
+    for m in re.finditer(r"\b([a-z0-9_]{1,7})\b", text):
+        word = m.group(1)
+        start = m.start(1)
+        end = m.end(1)
+        next_char = text[end:end+1]
+        if next_char in (":", "="):
+            continue  # let A or B handle "word:" / "word="
+        token = _pad_to_8(word.encode("latin-1"))
+        out.append((start, token))
+
+    return out
+
+
+
+def merge_tokens(
+    view: bytes,
+    sliding: List[Tuple[int, bytes]],
+    canonical: List[Tuple[int, bytes]]
+) -> List[bytes]:
+    """
+    Merge sliding-8 and canonical tokens into a single deterministic list of 8-byte tokens.
+
+    Ordering (per offset):
+      - For each byte offset in ascending order:
+          1) emit the sliding-8 token starting at that offset (if any)
+          2) then emit all canonical tokens starting at that offset,
+             but skip (dedup) if canonical == view[offset:offset+8]
+
+    Rationale:
+      - Avoid duplicate tokens at the same offset (identical bytes).
+      - Keep duplicates at different offsets (they are legitimate; H2 uses c+i).
+    """
+    # Index canonical tokens by offset
+    canon_by_off = {}
+    for off, tok in canonical:
+        canon_by_off.setdefault(off, []).append(tok)
+
+    tokens: List[bytes] = []
+    n = len(view)
+
+    # Fast access for sliding offsets
+    sliding_by_off = {off: tok for off, tok in sliding}
+
+    # Iterate all possible offsets where either sliding or canonical exist
+    all_offsets = sorted(set(list(sliding_by_off.keys()) + list(canon_by_off.keys())))
+
+    for off in all_offsets:
+        # 1) Sliding token at this offset (if any)
+        if off in sliding_by_off:
+            tokens.append(sliding_by_off[off])
+
+        # 2) Canonical tokens at this offset (dedup vs view slice)
+        if off in canon_by_off:
+            for ctok in canon_by_off[off]:
+                if off + TOKEN_WINDOW_SIZE <= n:
+                    # Compare to the actual 8-byte window in the view at the same offset
+                    if view[off:off+TOKEN_WINDOW_SIZE] == ctok:
+                        continue  # skip exact duplicate (already emitted by sliding)
+                # If view slice is shorter or different, keep canonical
+                tokens.append(ctok)
+    return tokens
