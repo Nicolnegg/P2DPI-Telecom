@@ -12,6 +12,8 @@ from flask import Flask, request, Response
 import requests
 import random
 import os
+from urllib.parse import quote_from_bytes
+
 
 # New: import the orchestrator helpers instead of direct sliding window
 from sender_utils import (
@@ -148,13 +150,143 @@ def proxy():
 # Local helper endpoint to trigger a test POST (unchanged)
 @app.route("/send_test_data", methods=["GET"])
 def trigger_test_client_request():
-    #BORRAR
-    import requests
-    data = {
-        "username": "alice",
-        "password": "Nicol",
-        "pdf_hint": "%PDF-1.4 lorem ipsum"
-    }
+    #ctr + k after crt + c -> comment
+    #ctr + k after crt + u -> descomment
+
+    #extortion_email
+    # fake_email = (
+    #     "From: admin@phishy.biz\n"
+    #     "To: you@example.com\n"
+    #     "Subject: Your account has been hacked! You need to unlock it.\n"
+    #     "\n"
+    #     "Be sure to read this message! Your personal data is threatened!\n"
+    #     "We installed and now we have to your device.\n"
+    #     "Send to this (BTC): bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh\n"
+    #     "You have 24 to make the or your account will be suspended.\n"
+    #     "This is your final warning. The will wipe your files.\n"
+    # )
+
+    # Email_generic_phishing
+    # fake_email = (
+    #     "From: admin@phishy.biz\n"
+    #     "To: you@example.com\n"
+    #     "Subject: Unauthorized access — verify now\n"
+    #     "\n"
+    #     "Hello sir/madam\n"
+    #     "Attention\n"
+    #     "Dear user\n"
+    #     "Account holder\n"
+    #     "\n"
+    #     "Click Here Now to Confirm and Verify your identity and Change password.\n"
+    #     "\n"
+    #     "Your request was Unauthorized and your session is Expired. Some records were Deleted.\n"
+    #     "Your account may be Suspended or Revoked, and we are Unable to proceed until you act.\n"
+    # )
+
+    #EK_Zeus
+    # fake_email = (
+    #     "HTTP/1.1 200 OK\n"
+    #     "Content-Type: text/html; charset=utf-8\n\n"
+    #     "<html><body>\n"
+    #     "<script>\n"
+    #     "position:absolute; z-index:99' !important;\n"
+    #     " -1)jsmSetDisplayStyle('popupmenu' , 'none');\n"
+    #     " '<tr><td><a href=\"#\">enlace</a></td></tr>\n"
+    #     "  jsmLastMenu = 'popupmenu';\n"
+    #     "  var ids = [1,2,3];\n"
+    #     "this.target = '_blank';\n"
+    #     " jsmPrevMenu, 'none');\n"
+    #     "  if(jsmPrevMenu ) { /* demo */ }\n"
+    #     ")if(MenuData[i]) { /* demo */ }\n"
+    #     " '<div style=\"display:none\">oculto</div>\n"
+    #     "popupmenu\n"
+    #     "  jsmSetDisplayStyle('popupmenu' , 'block');\n"
+    #     "function jsmHideLastMenu() { return; }\n"
+    #     " MenuData.length; i++;\n"
+    #     "</script>\n"
+    #     "</body></html>\n"
+    # )
+
+    #Maldoc_Dridex - PHISH_02Dez2015_attach_P_ORD_C_10156_124658
+    # ole = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
+
+    # fake_email =  (
+    #     b"From: billing@corp.local\n"
+    #     b"To: user@example.com\n"
+    #     b"Subject: Attachment\n\n"
+    # ) + ole + (
+    #     b"\n<meta>sample</meta>\n"
+    #     b"Execute\nProcess WriteParameterFiles\nWScript.Shell\nSTOCKMASTER\nInsertEmailFax\n"
+    # )
+
+    #Maldoc_Dridex - PHISH_02Dez2015_dropped_p0o6543f
+    # mz = bytes.fromhex("4D 5A 90 00 03 00 00 00")
+    # fake_email = (
+    #     b"From: billing@corp.local\n"
+    #     b"To: user@example.com\n"
+    #     b"Subject: p0o6543f test\n"
+    #     b"\n"
+    #     + mz + b"\n"
+    #     b"netsh.exe\n"
+    #     b"routemon.exe\n"
+    #     b"script=\n"
+    #     b"disconnect\n"
+    #     b"GetClusterResourceTypeKey\n"
+    #     b"QueryInformationJobObject\n"
+    #     b"interface\n"
+    #     b"connect\n"
+    #     b"FreeConsole\n"
+    # )
+
+    #Maldoc_Dridex - Dridex_Trojan_XML
+    # fake_email = (
+    #     "From: billing@corp.local\n"
+    #     "To: user@example.com\n"
+    #     "Subject: Dridex XML test\n"
+    #     "\n"
+    #     "<?xml version=\"1.0\"?>\n"
+    #     "<?mso-application progid=\"Word.Document\"?>\n"
+    #     "<w:document>\n"
+    #     "  <w:macrosPresent=\"yes\"/>\n"
+    #     "  <w:binData w:name=\"Object1\">QUJDRDEyMw==</w:binData>\n"
+    #     "  <o:Characters>0</o:Characters> \n"
+    #     "  <o:Lines>1</o:Lines> \n"
+    #     "</w:document>\n"
+    # )
+
+    #Maldoc_VBA_macro_code
+    # fake_email = (
+    #     b"From: billing@corp.local\n"
+    #     b"To: user@example.com\n"
+    #     b"Subject: OLE VBA macro test\n"
+    #     b"\n"
+    #     b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\n"
+    #     b"\x41\x74\x74\x72\x69\x62\x75\x74\x00\x65\x20\x56\x42\x5F"
+    # )
+
+    fake_email= (
+        b"From: billing@corp.local\n"
+        b"To: user@example.com\n"
+        b"Subject: ZIP VBA macro test\n"
+        b"\n"
+        b"\x50\x4B\x03\x04\x14\x00\x06\x00\n"
+        b"vbaProject.bin\n"
+    )
+
+    data = (
+        "username=alice"
+        "&password=Nicol"
+        "&pdf_hint=" + quote_from_bytes(b"%PDF-1.4 lorem ipsum") +
+        "&message="  + quote_from_bytes(fake_email)
+    ).encode("ascii")
+
+    # data = {
+    #     "username":"alice",
+    #     "password":"Nicol",
+    #     "pdf_hint":"%PDF-1.4 lorem ipsum",
+    #     "message": fake_email
+    # }
+
     try:
         response = requests.post(
             "https://sender.p2dpi.local:8443/",

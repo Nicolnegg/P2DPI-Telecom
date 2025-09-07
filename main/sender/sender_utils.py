@@ -226,13 +226,6 @@ def emit_sliding8(view: bytes, size: int = TOKEN_WINDOW_SIZE) -> List[Tuple[int,
     return [(i, view[i:i+size]) for i in range(n - size + 1)]
 
 
-def _pad_to_8(b: bytes) -> bytes:
-    """Pad with ASCII spaces to reach exactly 8 bytes (no truncation here)."""
-    if len(b) >= 8:
-        return b[:8]
-    return b + b" " * (8 - len(b))
-
-
 def emit_canonical_tokens(view: bytes) -> List[Tuple[int, bytes]]:
     """
     Canonical tokens (rule-agnostic) that preserve punctuation when relevant:
@@ -293,45 +286,15 @@ def merge_tokens(
     sliding: List[Tuple[int, bytes]],
     canonical: List[Tuple[int, bytes]]
 ) -> List[bytes]:
-    """
-    Merge sliding-8 and canonical tokens into a single deterministic list of 8-byte tokens.
-
-    Ordering (per offset):
-      - For each byte offset in ascending order:
-          1) emit the sliding-8 token starting at that offset (if any)
-          2) then emit all canonical tokens starting at that offset,
-             but skip (dedup) if canonical == view[offset:offset+8]
-
-    Rationale:
-      - Avoid duplicate tokens at the same offset (identical bytes).
-      - Keep duplicates at different offsets (they are legitimate; H2 uses c+i).
-    """
     # Index canonical tokens by offset
-    canon_by_off = {}
-    for off, tok in canonical:
-        canon_by_off.setdefault(off, []).append(tok)
+    # 1) Sliding-8 primero (contiguos para frases largas)
+    tokens = [tok for _, tok in sliding]
 
-    tokens: List[bytes] = []
-    n = len(view)
+    # 2) Luego canónicos (headers/short), evitando duplicados exactos
+    slid_set = {tok for _, tok in sliding}
+    for _, ctok in canonical:
+        if ctok in slid_set:
+            continue
+        tokens.append(ctok)
 
-    # Fast access for sliding offsets
-    sliding_by_off = {off: tok for off, tok in sliding}
-
-    # Iterate all possible offsets where either sliding or canonical exist
-    all_offsets = sorted(set(list(sliding_by_off.keys()) + list(canon_by_off.keys())))
-
-    for off in all_offsets:
-        # 1) Sliding token at this offset (if any)
-        if off in sliding_by_off:
-            tokens.append(sliding_by_off[off])
-
-        # 2) Canonical tokens at this offset (dedup vs view slice)
-        if off in canon_by_off:
-            for ctok in canon_by_off[off]:
-                if off + TOKEN_WINDOW_SIZE <= n:
-                    # Compare to the actual 8-byte window in the view at the same offset
-                    if view[off:off+TOKEN_WINDOW_SIZE] == ctok:
-                        continue  # skip exact duplicate (already emitted by sliding)
-                # If view slice is shorter or different, keep canonical
-                tokens.append(ctok)
     return tokens

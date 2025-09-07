@@ -30,14 +30,40 @@ PDF_VER_RANGE_RX = re.compile(r'^/%PDF-1\\\.\[([0-9])\-([0-9])\]/$')
 
 COUNT_CAPTURE_RE = re.compile(r'#\s*([A-Za-z0-9_]+)\s*([><]=?|==)\s*(\d+)', re.I)
 
+PLAIN_WITH_MODS_RX = re.compile(r'^\s*"((?:\\.|[^"\\])*)"\s*(.*)$', re.I)
 
-def clean_string_value(yara_string):
+
+_ESCAPE_RX = re.compile(r'\\x[0-9A-Fa-f]{2}|\\["\\nrt]')
+
+def unquote_yara_string(lit: str) -> str:
     """
-    Extracts the literal text from a quoted YARA string.
-    Example: '"From:" nocase' -> 'From:'
+    Strip the outer quotes of a YARA plain string (if present) and unescape
+    common YARA/C-like escapes: 
+    Example:
+      input:  "\"<?mso-application progid=\\\"Word.Document\\\"?>\""
+      output: "<?mso-application progid=\"Word.Document\"?>"
     """
-    m = re.match(r'"([^"]*)"', yara_string)
-    return m.group(1) if m else yara_string
+
+    s = lit
+    # Remove only the outer quotes if they are present
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+
+    # Replace escapes
+    def _repl(m: re.Match) -> str:
+        seq = m.group(0)
+        if seq == r'\"': return '"'
+        if seq == r'\\': return '\\'
+        if seq == r'\n': return '\n'
+        if seq == r'\r': return '\r'
+        if seq == r'\t': return '\t'
+        if seq.startswith(r'\x'):
+            try:
+                return bytes.fromhex(seq[2:]).decode('latin-1', errors='ignore')
+            except Exception:
+                return ''  # fallback safe
+        return seq  # shouldn't reach here
+    return _ESCAPE_RX.sub(_repl, s)
 
 
 def _preclean_condition(text: str) -> str:
@@ -472,11 +498,28 @@ def yara_to_default_dict(yara_path: str) -> dict:
         # Collect strings/hex/regex from the rule
         for s in rule.strings:
             if s.is_plain:
-                # Plain text string
-                dt = "string"
-                val = clean_string_value(s.text)
-                gname = extract_group_name(s.identifier)
-                _add_simple(simple_groups, gname, val, "string")
+                # s.text may contain things like:  "\"BTC\" nocase", "\"Wallet\" wide ascii", etc.
+                raw = s.text.strip()
+
+                m = PLAIN_WITH_MODS_RX.match(raw)
+                if m:
+                    # m.group(1) = the quoted content, m.group(2) = modifiers (e.g. "nocase wide")
+                    body = '"' + m.group(1) + '"'
+                    val = unquote_yara_string(body)  # -> BTC, Wallet, ...
+                    mods_str = (m.group(2) or "").strip().lower()
+                    # If you want to keep 'nocase' information for later matching, detect it here:
+                    has_nocase = 'nocase' in mods_str.split()
+                    # (optional) you could store this flag in the group if needed later:
+                    # g = simple_groups.setdefault(extract_group_name(s.identifier), {"match_type": "all", "strings": [], "_types": set()})
+                    # g.setdefault("_flags", set()).add("nocase") if has_nocase else None
+                    gname = extract_group_name(s.identifier)
+                    _add_simple(simple_groups, gname, val, "string")
+                else:
+                    # Fallback: unlikely to happen with valid YARA strings, but just in case
+                    val = unquote_yara_string(raw)
+                    gname = extract_group_name(s.identifier)
+                    _add_simple(simple_groups, gname, val, "string")
+
 
             elif s.is_hex:
                 raw = s.text  # includes braces
@@ -693,12 +736,12 @@ def yara_to_default_dict(yara_path: str) -> dict:
 if __name__ == "__main__":
     # Adjust this path to your YARA file
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    yara_path = os.path.join(script_dir, "YARA", "extortion_email.yar")
+    yara_path = os.path.join(script_dir, "YARA", "Maldoc_VBA_macro_code.yar")
 
     out = yara_to_default_dict(yara_path)
 
     # Write result to JSON near this script
-    out_path = os.path.join(script_dir, "diccioner.json")
+    out_path = os.path.join(script_dir, "dictionary.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     print(f"[OK] Wrote JSON to: {out_path}")

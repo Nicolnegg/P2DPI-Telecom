@@ -141,9 +141,6 @@ def encrypt_tokens(tokens: list, kSR_hex: str, counter: int, prf, h_fixed_hex: s
     encrypted_tokens = []
 
     for i, token_bytes in enumerate(tokens):
-        # Normalize the token to lowercase
-        token_bytes = token_bytes.decode(errors="ignore").lower().encode()
-
         # Token hex uppercase string
         key_buf = token_bytes[:16]
         output_buffer_fk = create_string_buffer(BUFFER_SIZE)

@@ -1,0 +1,66 @@
+{
+  "Contains_VBA_macro_code": {
+    "groups": {
+      "officemagic": {
+        "match_type": "all",
+        "data_type": "hex",
+        "strings": [
+          "D0 CF 11 E0 A1 B1 1A E1"
+        ]
+      },
+      "zipmagic": {
+        "match_type": "all",
+        "data_type": "hex",
+        "strings": [
+          "50 4B 03 04"
+        ]
+      },
+      "97str": {
+        "match_type": "any",
+        "data_type": "mixed",
+        "strings": [
+          {
+            "value": "_VBA_PROJECT_CUR",
+            "data_type": "string"
+          },
+          {
+            "value": "VBAProject",
+            "data_type": "string"
+          },
+          {
+            "value": "41 74 74 72 69 62 75 74 00 65 20 56 42 5F",
+            "data_type": "hex"
+          }
+        ]
+      },
+      "xmlstr": {
+        "match_type": "any",
+        "data_type": "string",
+        "strings": [
+          "vbaProject.bin",
+          "vbaData.xml"
+        ]
+      }
+    },
+    "conditions": [
+      {
+        "or": [
+          {
+            "groups": [
+              "officemagic",
+              "97str"
+            ],
+            "operator": "and"
+          },
+          {
+            "groups": [
+              "zipmagic",
+              "xmlstr"
+            ],
+            "operator": "and"
+          }
+        ]
+      }
+    ]
+  }
+}

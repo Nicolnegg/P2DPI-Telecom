@@ -1,335 +1,428 @@
 # middlebox/mb/mb_main.py
-from flask import Flask, request, jsonify
-import requests
-from ctypes import cast, CDLL, c_char_p, c_int, create_string_buffer, c_ubyte, POINTER
-import os
-import hashlib
-import struct
+#
+# Role:
+#   - Receive encrypted rule-set (by groups) from RG.
+#   - Fan-out obfuscated tokens to Sender/Receiver; receive intermediates; compute Sj.
+#   - Rebuild final session ruleset; keep flat SESSION_RULES for H2 online matching.
+#   - Evaluate incoming encrypted traffic and enforce block/allow decision.
+#
+# This file stays small; heavy lifting is in utils.py.
 
+from flask import Flask, request, jsonify
+import os , json
+import uuid
+import requests
+import logging
+from ctypes import c_char_p, create_string_buffer
+
+from mb_utils import (
+    load_prf, load_h_fixed, load_kmb_from_file,
+    h2_compute, flatten_ruleset_from_rg,
+    rebuild_session_ruleset, pretty_print_ruleset,
+    build_runtime_index, reset_runtime_state,
+    process_encrypted_tokens_with_conditions,
+    snapshot_rule_status
+)
 
 app = Flask(__name__)
 
+app.logger.setLevel(logging.DEBUG)
 
+# -------------------------
+# Config / Constants
+# -------------------------
+
+# Receiver endpoints (adjust to your deployment)
+RECEIVER_URL = "https://receiver.p2dpi.local:10443/store_tokens"
+RECEIVER_DELETE_URL = "https://receiver.p2dpi.local:10443/delete_tokens"
+CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
+
+# -------------------------
+# Globals (runtime state)
+# -------------------------
+# Legacy placeholders for compatibility
 RULES = []
 S_INTERMEDIATE = []
 R_INTERMEDIATE = []
-SESSION_RULES = []
-kmb = None
-kmb_buf = None  # Keep a reference so GC doesn't free the buffer
 
-RECEIVER_URL = "https://receiver.p2dpi.local:10443/store_tokens" 
-CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
-RECEIVER_DELETE_URL = "https://receiver.p2dpi.local:10443/delete_tokens" 
+# Finalized session artifacts
+SESSION_RULES = []       # FLAT list of Sj (hex) used in /receive_tokens
+RULESET_SESSION = None   # Structured rule-set with session_tokens (for introspection/logging)
 
-# === Load PRF (FKH_inv_hex) ===
-current_dir = os.path.dirname(os.path.abspath(__file__))
-prf_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'prf.so'))
-prf = CDLL(prf_path)
+# In-flight batches
+# BATCHES[batch_id] = {
+#   "ruleset": <copy of RG payload>,
+#   "flat":    [ {"seq": int, "obfuscated": ri_hex, "signature": b64}, ... ],
+#   "revmap":  { seq: (rule_idx, group_key, string_idx, enc_idx) },
+#   "sender_I":   { seq: Ii_hex },
+#   "receiver_I": { seq: Ii_hex }
+# }
+BATCHES = {}
 
-prf.FKH_inv_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
-prf.FKH_inv_hex.restype = c_int
+# Runtime matching state (built after finalizing a batch)
+RUNTIME = None       # structured rules/groups/strings with run-state
+SJ_TARGETS = None    # map sj_hex_lower -> list of (rule_idx, group_key, string_idx, token_pos)
 
-# int H2(const unsigned char *y_bytes, int y_len, const unsigned char *h_key, unsigned char *output)
-prf.H2.argtypes = [
-    POINTER(c_ubyte),  # y_bytes (input 16 bytes)
-    c_int,             # y_len
-    POINTER(c_ubyte),  # h_key (16 bytes)
-    POINTER(c_ubyte),  # output (16 bytes)
-]
-prf.H2.restype = c_int
+# Crypto handles
+prf = load_prf()                     # C library
+h_fixed = load_h_fixed()             # Optional: can be None
+kmb = None                           # c_char_p with ASCII-hex
+_kmb_buf_keepalive = None            # keep buffer reference alive
 
-def load_h_fixed():
-    global h_fixed
-    try:
-        shared_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared'))
-        h_path = os.path.join(shared_dir, 'h_fixed.txt')
-        with open(h_path, "r") as f:
-            h_fixed = f.read().strip()
-        print(f"[MB] Loaded fixed point h from {h_path}")
-    except Exception as e:
-        print("[MB] Failed to load h_fixed:", e)
 
-# Try loading existing key at startup
-def load_kmb_from_file():
-    global kmb, kmb_buf
-    try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        keys_dir = os.path.join(current_dir, "keys")
-        kmb_path = os.path.join(keys_dir, "kmb.key")
-        with open(kmb_path, "rb") as f:
-            kmb_bytes = f.read()
-            kmb_hex_str = kmb_bytes.hex()  # Esto es la clave en ASCII hex
-            kmb_buf = create_string_buffer(kmb_hex_str.encode())  # Buffer con ASCII hex
-            kmb = c_char_p(kmb_buf.value)
-            print(f"[MB] Loaded existing kMB as hex from {kmb_path}")
-    except FileNotFoundError:
-        print("[MB] No existing kMB key found on startup.")
-    except Exception as e:
-        print("[MB] Error loading kMB key:", e)
-
-load_kmb_from_file()
-load_h_fixed()
-
-def h2_compute(counter_i, session_key_hex):
+def _ensure_kmb_loaded():
     """
-    Compute H2((c+i), Sj) using the C function.
-    counter_i: integer c+i (32-bit int)
-    session_key_hex: full EC point Sj in hex (long hex string)
-    Returns: 16-byte AES-ECB encrypted output as hex string
+    Ensure kMB is loaded into memory before we need it.
     """
-    # Prepare input y_bytes: 4 bytes big-endian + 12 zero bytes
-    y_bytes = struct.pack(">QQ", 0, counter_i)
-    y_buf = create_string_buffer(y_bytes, 16)
-
-    # Convert hex string point Sj to bytes
-    sj_bytes = bytes.fromhex(session_key_hex)
-
-    # Hash Sj bytes (e.g. SHA-256)
-    hash_sj = hashlib.sha256(sj_bytes).digest()
-
-    # Use first 16 bytes of hash as AES key
-    h_key_bytes = hash_sj[:16]
-
-    # Prepare h_key buffer
-    h_key_buf = create_string_buffer(h_key_bytes, 16)
-
-    # Output buffer (16 bytes)
-    output_buf = create_string_buffer(16)
-
-    # Call C H2 function
-    success = prf.H2(
-        cast(y_buf, POINTER(c_ubyte)),
-        16,
-        cast(h_key_buf, POINTER(c_ubyte)),
-        cast(output_buf, POINTER(c_ubyte))
-    )
-
-    if not success:
-        raise RuntimeError("H2 encryption failed")
-
-    return output_buf.raw.hex()
+    global kmb, _kmb_buf_keepalive
+    if kmb is not None:
+        return
+    try:
+        kmb, _kmb_buf_keepalive = load_kmb_from_file()
+        app.logger.info("[MB] Loaded existing kMB from keys/kmb.key")
+    except Exception as e:
+        app.logger.warning(f"[MB] kMB not loaded yet: {e}")
 
 
-# === Endpoint to receive and forward obfuscated rules ===
+# -------------------------
+# Endpoints
+# -------------------------
+
 @app.route("/upload_rules", methods=["POST"])
 def upload_rules():
-    global RULES
-    RULES = request.json
-    print("[MB] Received rules:", RULES)
+    """
+    RG posts the encrypted-by-group ruleset here.
+    MB:
+      - Assigns a fresh batch_id
+      - Flattens all {ri,sig} into an ordered list with "seq"
+      - Stores (ruleset, flat, rev_map) under that batch_id
+      - Fan-out to Sender and Receiver
+    """
+    try:
+        ruleset = request.get_json(force=True)
+        if not ruleset or "rules" not in ruleset:
+            return jsonify({"error": "Malformed ruleset"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    batch_id = str(uuid.uuid4())
+    flat, rev_map = flatten_ruleset_from_rg(ruleset)
+
+    BATCHES[batch_id] = {
+        "ruleset": ruleset,
+        "flat": flat,
+        "revmap": rev_map,
+        "sender_I": {},
+        "receiver_I": {}
+    }
+
+    app.logger.info(f"[MB] Received RG ruleset. batch_id={batch_id}, tokens={len(flat)}")
+
+    fanout_payload = {
+        "batch_id": batch_id,
+        "tokens": flat
+    }
 
     # Forward to Receiver (R)
     try:
-        r_response = requests.post("http://localhost:10000/receive_rules", json=RULES)
-        print("[MB → R] Response:", r_response.status_code)
+        r_response = requests.post("http://localhost:10000/receive_rules", json=fanout_payload, timeout=5)
+        app.logger.info("[MB → R] /receive_rules: %s", r_response.status_code)
     except Exception as e:
-        print("[MB → R] Error:", e)
+        app.logger.warning("[MB → R] Error: %s", e)
 
     # Forward to Sender (S)
     try:
-        s_response = requests.post("http://localhost:11000/receive_rules", json=RULES)
-        print("[MB → S] Response:", s_response.status_code)
+        s_response = requests.post("http://localhost:11000/receive_rules", json=fanout_payload, timeout=5)
+        app.logger.info("[MB → S] /receive_rules: %s", s_response.status_code)
     except Exception as e:
-        print("[MB → S] Error:", e)
+        app.logger.warning("[MB → S] Error: %s", e)
 
-    return "Rules received and forwarded to S and R", 200
+    try:
+        app.logger.debug("[MB] Snapshot (no match):\n%s",
+                        json.dumps(snapshot_rule_status(RUNTIME), indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+
+    return jsonify({"status": "ok", "batch_id": batch_id}), 200
 
 
-@app.route("/receive_intermediate", methods=["POST"])
-def receive_intermediate():
-    global S_INTERMEDIATE, R_INTERMEDIATE, SESSION_RULES
+@app.route("/receive_intermediate/sender", methods=["POST"])
+def receive_intermediate_sender():
+    """
+    Sender returns:
+      { "batch_id": "<uuid>", "intermediate": [ { "seq": N, "Ii": "<hex>" }, ... ] }
+    Store and try finalize.
+    """
+    try:
+        data = request.get_json(force=True)
+        batch_id = data.get("batch_id")
+        inter = data.get("intermediate")
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
 
-    data = request.json
-    if not data:
-        return jsonify({"error": "No data received"}), 400
+    if not batch_id or not isinstance(inter, list):
+        return jsonify({"error": "Missing batch_id or intermediate"}), 400
+    if batch_id not in BATCHES:
+        return jsonify({"error": "Unknown batch_id"}), 404
 
-    if "sender_intermediate" in data:
-        S_INTERMEDIATE = data["sender_intermediate"]
-        print("[MB] Received intermediate rules from Sender:", S_INTERMEDIATE)
-    elif "receiver_intermediate" in data:
-        R_INTERMEDIATE = data["receiver_intermediate"]
-        print("[MB] Received intermediate rules from Receiver:", R_INTERMEDIATE)
-    else:
-        return jsonify({"error": "Unknown sender"}), 400
+    BATCHES[batch_id]["sender_I"] = {int(x["seq"]): x["Ii"] for x in inter if "seq" in x and "Ii" in x}
+    app.logger.info(f"[MB] Got Sender intermediates for batch {batch_id}: {len(BATCHES[batch_id]['sender_I'])} items")
 
-    # === Only continue if both have arrived ===
-    if not S_INTERMEDIATE or not R_INTERMEDIATE:
-        print("[MB] One side received. Waiting for the other party...")
-        return jsonify({"status": "Waiting for other party"}), 202
+    return _try_finalize_batch(batch_id)
 
-    # Normalize and compare
-    s_norm = sorted([x.strip().lower() for x in S_INTERMEDIATE])
-    r_norm = sorted([x.strip().lower() for x in R_INTERMEDIATE])
 
-    if s_norm != r_norm:
-        print("[MB] Intermediate rules from S and R do not match. Disconnecting.")
-        # Clear to avoid reusing old ones
-        S_INTERMEDIATE = []
-        R_INTERMEDIATE = []
-        return jsonify({"error": "Mismatch between S and R"}), 403
+@app.route("/receive_intermediate/receiver", methods=["POST"])
+def receive_intermediate_receiver():
+    """
+    Receiver returns:
+      { "batch_id": "<uuid>", "intermediate": [ { "seq": N, "Ii": "<hex>" }, ... ] }
+    Store and try finalize.
+    """
+    try:
+        data = request.get_json(force=True)
+        batch_id = data.get("batch_id")
+        inter = data.get("intermediate")
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
 
-    print("[MB] Intermediate rules match. Computing session rules...")
+    if not batch_id or not isinstance(inter, list):
+        return jsonify({"error": "Missing batch_id or intermediate"}), 400
+    if batch_id not in BATCHES:
+        return jsonify({"error": "Unknown batch_id"}), 404
 
+    BATCHES[batch_id]["receiver_I"] = {int(x["seq"]): x["Ii"] for x in inter if "seq" in x and "Ii" in x}
+    app.logger.info(f"[MB] Got Receiver intermediates for batch {batch_id}: {len(BATCHES[batch_id]['receiver_I'])} items")
+
+    return _try_finalize_batch(batch_id)
+
+
+def _try_finalize_batch(batch_id: str):
+    """
+    When both sender_I and receiver_I exist and match exactly:
+      - Compute Sj = FKH_inv_hex(Ii, kMB) for all seq
+      - Rebuild final structured rule-set with session_tokens
+      - Overwrite SESSION_RULES / RULESET_SESSION
+      - Drop batch state
+    Else, reply 'waiting'.
+    """
+    if batch_id not in BATCHES:
+        return jsonify({"error": "Unknown batch_id"}), 404
+
+    state = BATCHES[batch_id]
+    sI = state.get("sender_I") or {}
+    rI = state.get("receiver_I") or {}
+
+    if not sI or not rI:
+        return jsonify({"status": "waiting"}), 202
+
+    s_keys = set(sI.keys())
+    r_keys = set(rI.keys())
+    if s_keys != r_keys:
+        app.logger.error(f"[MB] Mismatch seq sets for batch {batch_id}. Aborting.")
+        del BATCHES[batch_id]
+        return jsonify({"error": "Seq set mismatch between S and R"}), 403
+
+    for seq in s_keys:
+        if (sI[seq] or "").strip().lower() != (rI[seq] or "").strip().lower():
+            app.logger.error(f"[MB] Ii mismatch at seq={seq} for batch {batch_id}. Aborting.")
+            del BATCHES[batch_id]
+            return jsonify({"error": "Ii mismatch between S and R"}), 403
+
+    _ensure_kmb_loaded()
     if kmb is None:
-        print("[MB] ERROR: kMB is None. Aborting computation.")
+        app.logger.error("[MB] ERROR: kMB is None. Cannot compute session rules.")
+        del BATCHES[batch_id]
         return jsonify({"error": "kMB not loaded"}), 500
 
-    SESSION_RULES.clear()
-
-    for Ii in s_norm:
-        Ii_c = c_char_p(Ii.upper().encode())
-        output_buffer = create_string_buffer(200)
+    seq_sorted = sorted(s_keys)
+    seq_to_sj = {}
+    flat_session = []
+    for seq in seq_sorted:
+        Ii_hex = sI[seq].upper().encode()
+        out_buf = create_string_buffer(200)
         try:
-            res = prf.FKH_inv_hex(Ii_c, kmb, output_buffer, 200)
-            print(f"[MB] FKH_inv_hex returned: {res}")
+            res = prf.FKH_inv_hex(c_char_p(Ii_hex), kmb, out_buf, 200)
         except Exception as e:
-            print(f"[MB] Exception during FKH_inv_hex call: {e}")
-            return jsonify({"error": f"PRF error: {str(e)}"}), 500
-
+            app.logger.exception(f"[MB] Exception during FKH_inv_hex (seq={seq}): {e}")
+            del BATCHES[batch_id]
+            return jsonify({"error": "PRF error"}), 500
         if res != 1:
-            print(f"[MB] FKH_inv_hex failed for Ii: {Ii}")
-            return jsonify({"error": f"Failed to compute FKH_inv for Ii: {Ii}"}), 500
+            app.logger.error(f"[MB] FKH_inv_hex failed at seq={seq}")
+            del BATCHES[batch_id]
+            return jsonify({"error": f"FKH_inv failed at seq={seq}"}), 500
 
-        Si = output_buffer.value.decode()
-        SESSION_RULES.append(Si)
+        Sj_hex = out_buf.value.decode()
+        seq_to_sj[seq] = Sj_hex
+        flat_session.append(Sj_hex)
 
-    print("[MB] Session rules:")
-    for s in SESSION_RULES:
-        print("  -", s)
+    # Rebuild structured ruleset
+    ruleset_in = state["ruleset"]
+    revmap = state["revmap"]
+    final_ruleset = rebuild_session_ruleset(ruleset_in, revmap, seq_to_sj)
 
-    # Clean
-    S_INTERMEDIATE = []
-    R_INTERMEDIATE = []
+    # Publish
+    global SESSION_RULES, RULESET_SESSION
+    SESSION_RULES = flat_session
+    RULESET_SESSION = final_ruleset
 
-    return jsonify({"status": "Intermediate rules processed", "session_rules": SESSION_RULES}), 200
+    # Build runtime index for structured matching (sequences, groups, conditions)
+    global RUNTIME, SJ_TARGETS
+    RUNTIME, SJ_TARGETS = build_runtime_index(RULESET_SESSION)
+    reset_runtime_state(RUNTIME)
+
+    app.logger.info(f"[MB] ✅ Finalized batch {batch_id}. session tokens: {len(SESSION_RULES)}")
+    app.logger.debug("\n[MB] ===== FINAL RULESET (SESSION) =====\n%s\n[MB] ===== END =====\n",
+                     pretty_print_ruleset(RULESET_SESSION))
+
+    del BATCHES[batch_id]
+    return jsonify({"status": "finalized", "session_rules_count": len(SESSION_RULES)}), 200
 
 
-
-# === Endpoint to receive and store kMB securely ===
 @app.route("/receive_kmb", methods=["POST"])
 def receive_kmb():
-    global kmb, kmb_buf  # Keep a global reference to the key buffer and pointer
+    """
+    Accept ASCII-hex kMB from RG (as 'kmb'), persist to keys/kmb.key, and load to memory.
+    """
+    global kmb, _kmb_buf_keepalive
 
     kmb_hex = request.json.get("kmb")
     if not kmb_hex:
         return "Missing kMB", 400
 
     try:
-        kmb_hex_str = kmb_hex.upper()  # ensure uppercase hex
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        keys_dir = os.path.join(current_dir, "keys")
+        kmb_hex_str = kmb_hex.upper()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        keys_dir = os.path.join(base_dir, "keys")
         os.makedirs(keys_dir, exist_ok=True)
 
         kmb_path = os.path.join(keys_dir, "kmb.key")
         with open(kmb_path, "wb") as f:
             f.write(bytes.fromhex(kmb_hex_str))
 
-        kmb_buf = create_string_buffer(kmb_hex_str.encode())
-        kmb = c_char_p(kmb_buf.value)
+        _kmb_buf_keepalive = create_string_buffer(kmb_hex_str.encode())
+        kmb = c_char_p(_kmb_buf_keepalive.value)
 
-        print(f"[MB] kMB saved in {kmb_path} and updated in memory.")
+        app.logger.info(f"[MB] kMB saved in {kmb_path} and updated in memory.")
         return "kMB received", 200
 
     except Exception as e:
-        print("[MB] Error in /receive_kmb:", e)
+        app.logger.exception("[MB] Error in /receive_kmb: %s", e)
         return "Internal error", 500
 
-# === Endpoint to receive encrypted tokens from Sender HTTPS ===
+
 @app.route("/receive_tokens", methods=["POST"])
 def receive_tokens():
+    """
+    Online detection with conditions:
+      - For each traffic token Ti at index i, for each Sj, compute H2(c+i, Sj) and compare.
+      - Maintain per-string run state to require full consecutive sequences for long strings.
+      - Per group, apply match_type ('any'/'all').
+      - Per rule, evaluate 'conditions' (and/or/not). If a rule is satisfied -> block.
+    """
     data = request.get_json()
-    # Check if the request JSON contains both 'encrypted_tokens' and counter 'c'
     if not data or "encrypted_tokens" not in data or "c" not in data:
         return jsonify({"error": "Missing encrypted_tokens or counter c"}), 400
 
-    tokens = data["encrypted_tokens"]  # List of encrypted tokens in hex format
-    c_hex = data["c"]                  # Counter 'c' sent as hex string
-    counter = int(c_hex, 16)           # Convert counter from hex string to integer
-    print(f"[MB] Received {len(tokens)} encrypted tokens with counter c={counter}")
+    tokens = data["encrypted_tokens"]
+    c_hex = data["c"]
+    counter = int(c_hex, 16)
+    app.logger.info(f"[MB] Received {len(tokens)} encrypted tokens with counter c={counter}")
 
-    # Perform detection 
-    alert_raised = False
-
-    # SESSION_RULES already contains the list of session keys Sj in hex format
-    for i, Ti in enumerate(tokens):
-        for j, Sj in enumerate(SESSION_RULES):
-            # Compute H2(c + i, Sj) using the C function
-            h2_val = h2_compute(counter + i, Sj)
-
-            # Compare the computed H2 value with the received token (case-insensitive)
-            if h2_val.lower() == Ti.lower():
-                print(f"[ALERT] Match found! Token {i} matches H2(c+i, S{j})")
-                alert_raised = True
-                break
-        if alert_raised:
-            break
-    
-    if alert_raised:
-        # immediately return a response indicating a malicious token was detected
-        
-        # Inform the Receiver to delete all stored tokens for this counter
+    # If no structured rules were loaded, just forward to Receiver as before
+    if not RULESET_SESSION or not RUNTIME or not SJ_TARGETS:
+        payload = {"tokens": tokens, "counter": c_hex}
         try:
-            delete_payload = {
-                "counter": c_hex  # Only the counter is needed now
-            }
+            response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
+            app.logger.info(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
+            if response.status_code != 200:
+                return jsonify({"error": "Failed to store tokens at Receiver"}), 500
+        except Exception as e:
+            app.logger.exception(f"[MB] Critical error sending tokens to Receiver: {e}")
+            return jsonify({"error": "Critical failure sending tokens to Receiver"}), 500
+        return jsonify({"status": "ok", "note": "no structured rules loaded"}), 200
+
+    # Reset run state for this evaluation (optional; remove if you want to carry state cross-requests)
+    reset_runtime_state(RUNTIME)
+
+    # Use the structured matching engine
+    alert, details = process_encrypted_tokens_with_conditions(
+        prf=prf,
+        tokens=tokens,
+        counter=counter,
+        runtime=RUNTIME,
+        sj_to_targets=SJ_TARGETS,
+        h2_func=h2_compute
+    )
+
+    if alert:
+        try:
+            app.logger.debug("[MB] Match details g_truth: %s", json.dumps(details.get("g_truth", {}), ensure_ascii=False))
+            app.logger.debug("[MB] Clause hit: %s", json.dumps(details.get("cond", {}), ensure_ascii=False))
+            # Si quieres ver snapshot completo:
+            if details.get("snapshot"):
+                app.logger.debug("[MB] Snapshot at match:\n%s", json.dumps(details["snapshot"], indent=2, ensure_ascii=False))
+        except Exception:
+            pass
+
+        # Notify Receiver to delete stored tokens for this counter and block
+        try:
+            delete_payload = {"counter": c_hex}
             delete_response = requests.post(
                 RECEIVER_DELETE_URL,
                 json=delete_payload,
                 verify=CA_CERT_PATH,
                 timeout=5
             )
-            print(f"[MB ➜ R] Notify Receiver to delete tokens response: {delete_response.status_code} - {delete_response.text}")
+            app.logger.info(f"[MB ➜ R] Notify Receiver delete tokens: {delete_response.status_code} - {delete_response.text}")
         except Exception as e:
-            print(f"[MB] Failed to notify Receiver about malicious tokens: {e}")
-            
+            app.logger.warning(f"[MB] Failed to notify Receiver about malicious tokens: {e}")
+
         return jsonify({
             "status": "alert",
-            "message": "Malicious token detected. Transmission blocked."
-        }), 403  # HTTP 403 Forbidden status code, or any other you prefer
+            "message": "Rule conditions satisfied. Transmission blocked.",
+            "matched_at": details.get("matched_at"),
+            "debug": {
+                "rule_idx": details.get("rule_idx"),
+                "clause_idx": details.get("clause_idx"),
+                "g_truth": details.get("g_truth"),
+                "cond": details.get("cond")
+            }
+        }), 403
 
-    # Send tokens and counter to the Receiver to store them
-    payload = {
-        "tokens": tokens,
-        "counter": c_hex
-    }
-
+    # No rule satisfied -> forward to Receiver
+    payload = {"tokens": tokens, "counter": c_hex}
     try:
-        # Make a POST request to the Receiver's store_tokens endpoint
         response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
-        print(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
-
+        app.logger.info(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
         if response.status_code != 200:
-            print(f"[MB] Critical error: Receiver responded with status {response.status_code}")
             return jsonify({"error": "Failed to store tokens at Receiver"}), 500
-
     except Exception as e:
-        print(f"[MB] Critical error sending tokens to Receiver: {e}")
+        app.logger.exception(f"[MB] Critical error sending tokens to Receiver: {e}")
         return jsonify({"error": "Critical failure sending tokens to Receiver"}), 500
 
-    # Return alert if any match is detected, otherwise confirm no matches
-    if alert_raised:
-        return jsonify({"status": "alert"}), 200
-    else:
-        print("[MB] ✅ No matches found. Traffic considered safe.")
-        return jsonify({"status": "ok"}), 200
+    app.logger.info("[MB] ✅ No rule conditions satisfied. Traffic allowed.")
+    return jsonify({"status": "ok"}), 200
 
-# === Endpoint to receive alerts from Receiver indicating possible attack ===
+
+
 @app.route("/validation", methods=["POST"])
 def receive_alert_from_receiver():
     """
-    Receives alert JSON from Receiver indicating possible attack or anomaly.
+    Optional alert channel from Receiver (for validation audits).
     """
     alert_data = request.get_json()
-
     if not alert_data:
         return jsonify({"error": "Missing alert data"}), 400
 
-    print("\n[MB] ⚠️ ALERT RECEIVED FROM RECEIVER ⚠️")
-    print("[MB] Details:", alert_data)
-
+    app.logger.warning("\n[MB] ⚠️ ALERT RECEIVED FROM RECEIVER ⚠️\n[MB] Details: %s", alert_data)
     return jsonify({"status": "Alert received"}), 200
 
 
 if __name__ == "__main__":
-    print("[MB] Starting Flask server on port 9999...")
-    app.run(host="0.0.0.0", port=9999)
+    # Try load kMB (if the key file already exists) and h
+    _ensure_kmb_loaded()
+    if h_fixed:
+        app.logger.info("[MB] Loaded fixed point h")
 
+    app.logger.info("[MB] Starting Flask server on port 9999...")
+    app.run(host="0.0.0.0", port=9999)
