@@ -526,12 +526,19 @@ def yara_to_default_dict(yara_path: str) -> dict:
                 tokens = split_hex_into_tokens(raw)
 
                 if is_hex_with_wildcards_or_gaps(raw):
-                    # Hex with wildcards/ranges -> create a chain group with literal runs and sequence ops
+                    # Hex con comodines/rangos -> grupo "cadena" con nombre del label
                     runs = contiguous_literal_runs(tokens)
                     if not runs:
-                        # Fully wildcard pattern: ignore (rare)
                         continue
-                    group_name = f"group{chain_counter}"
+
+                    # ⬇️ usar el label de YARA como nombre de grupo
+                    label_name = extract_group_name(s.identifier)  # ej: "$ChinaChopperASPX" -> "ChinaChopperASPX"
+                    group_name = label_name or f"group{chain_counter}"
+
+                    # (opcional) guarda-choques por colisión de nombres
+                    if any(cg["group_name"] == group_name for cg in chain_groups) or group_name in simple_groups:
+                        group_name = f"{group_name}_chain{chain_counter}"
+
                     chain_counter += 1
 
                     id_list, strings_list = [], []
@@ -715,7 +722,12 @@ def yara_to_default_dict(yara_path: str) -> dict:
                 }
 
         # Build logical conditions node from YARA condition AST
-        logic_node = condition_to_or_of_group_ands(rule.condition.text, list(simple_groups.keys())) if rule.condition else None
+        all_groups_names = list(simple_groups.keys()) + [cg["group_name"] for cg in chain_groups]
+        logic_node = condition_to_or_of_group_ands(
+            rule.condition.text, 
+            all_groups_names
+        ) if rule.condition else None
+
         if logic_node:
             rule_out["conditions"].append(logic_node)
         else:

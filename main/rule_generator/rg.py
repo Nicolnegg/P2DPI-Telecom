@@ -21,6 +21,8 @@ import json
 import os
 import requests
 import re
+import copy
+
 from collections import defaultdict
 from crypto_utils import load_private_key, sign_data
 from rg_utils import emit_tokens_for_pattern, emit_tokens_for_hex_literal, normalize_view_text
@@ -30,6 +32,8 @@ from rg_utils import emit_tokens_for_pattern, emit_tokens_for_hex_literal, norma
 DEBUG_TOKENS = True
 
 _BASE_RX = re.compile(r"^([a-zA-Z0-9]+)")
+
+MIN_SEG_BYTES = 7  # drop si len(bytes) < 7  (<=6)
 
 
 def _ascii_safe(b: bytes) -> str:
@@ -217,52 +221,342 @@ def _process_group_simple(group_obj: Dict[str, Any]) -> Dict[str, Any]:
     return {"match_type": match_type, "strings": strings_out}
 
 
-def _process_group_cadena(group_obj: Dict[str, Any]) -> Dict[str, Any]:
+def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
+                          seq_next_op_map: Dict[str, str]) -> tuple[Dict[str, Any], Dict[str, str], set, set, Dict[str, int], List[str]]:
     """
-    Process a 'cadena' group (hex with wildcards captured as literal segments).
-    Each segment should produce a single entry with its enc_tokens list (flattened across any inner-groups).
+    Devuelve:
+      - grupo_listo (sin 'value' en claro, con enc_tokens)
+      - sid_map: {id_original -> id_ofuscado} (solo de kept)
+      - absorbed_from: set(ids 'from' que absorbieron 1 byte)
+      - dropped_sids: set(ids originales de segmentos omitidos por < MIN_SEG_BYTES)
+      - seg_len_map: {id_original -> len_en_bytes} (de todos, útil para componer gaps)
+      - kept_order: [ids originales en orden], solo los conservados
     """
     strings_in = group_obj.get("strings", [])
     strings_out: List[Dict[str, Any]] = []
+    sid_map: Dict[str, str] = {}
+    absorbed_from: set = set()
+    dropped_sids: set = set()
+    seg_len_map: Dict[str, int] = {}
+    kept_order: List[str] = []
 
-    for s in strings_in:
-        sid = s.get("id")
+    for idx, s in enumerate(strings_in):
+        orig_sid = s.get("id")
         val = s.get("value", "")
-        groups = _enc_tokens_for_hex_value(val)  # returns List[List[dict]]
-        # For a cadena segment we want a single enc_tokens list for that segment:
-        flattened = [tok for group in groups for tok in group]
-        strings_out.append({"id": sid, "enc_tokens": flattened})
+        try:
+            b = _hex_to_bytes(val)
+        except Exception:
+            b = b""
 
-    return {"match_type": "cadena", "strings": strings_out}
+        seg_len_map[orig_sid] = len(b)
+
+        # --- drop si < 7 bytes ---
+        if len(b) < MIN_SEG_BYTES:
+            if DEBUG_TOKENS:
+                print(f"[RG][DROP] gid={gid} orig_sid={orig_sid} len={len(b)} < {MIN_SEG_BYTES} -> drop")
+            dropped_sids.add(orig_sid)
+            continue
+
+        new_sid = f"{gid}_seg{idx}"
+        sid_map[orig_sid] = new_sid
+        kept_order.append(orig_sid)
+
+        # ¿absorción de 7 bytes?
+        do_absorb = (
+            len(b) == 7 and
+            orig_sid in seq_next_op_map and
+            _op_allows_absorb(seq_next_op_map[orig_sid])
+        )
+        if DEBUG_TOKENS:
+            print(f"[RG][ABSORB?] gid={gid} orig_sid={orig_sid} len={len(b)} "
+                  f"op_next={seq_next_op_map.get(orig_sid)} -> {do_absorb}")
+
+        if do_absorb:
+            variants = _enc_variants_for_hex7_absorb_right_from_hex(val)  # List[List[dict]]
+            absorbed_from.add(orig_sid)
+
+            # Opción A (lo que pides): exponer las 256 opciones bajo "value"
+            #   "value": [ {"enc_tokens":[...]}, {"enc_tokens":[...]}, ... x256 ]
+            strings_out.append({
+                "id": new_sid,
+                "value": [{"enc_tokens": v} for v in variants]
+            })
+
+        else:
+            groups = _enc_tokens_for_hex_value(val)  # List[List[dict]]
+            enc_tokens = [tok for group in groups for tok in group]
+            strings_out.append({"id": new_sid, "enc_tokens": enc_tokens})
+
+    return (
+        {"match_type": "cadena", "strings": strings_out},
+        sid_map,
+        absorbed_from,
+        dropped_sids,
+        seg_len_map,
+        kept_order,
+    )
+
+
+
+# --- Helpers para absorción de 7 bytes en cadena ---
+
+_HEX_SP_RE = re.compile(r"\s+")
+
+def _hex_to_bytes(hex_text: str) -> bytes:
+    s = hex_text.strip()
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1].strip()
+    s = _HEX_SP_RE.sub(" ", s)
+    s_hex = s.replace(" ", "")
+    return bytes.fromhex(s_hex)
+
+
+def _first_group_name_for_base(conditions: List[Dict[str, Any]], base: str) -> str | None:
+    for n in conditions or []:
+        if "sequence" in n and isinstance(n["sequence"], dict):
+            g = str(n["sequence"].get("group", ""))
+            if _base_name(g).lower() == base:
+                return g
+    return None
+
+
+def _ascii_lower_bytes_local(b: bytes) -> bytes:
+    return bytes(x + 32 if 65 <= x <= 90 else x for x in b)
+
+def _op_allows_absorb(op: str) -> bool:
+    """
+    True si hay al menos 1 byte de holgura entre 'from' y 'to'.
+    """
+    if not isinstance(op, str):
+        return False
+    op = op.strip().upper()
+    if op == "ONE_WILDCARD":
+        return True
+    m = re.fullmatch(r"RANGE_(\d+)_(\d+)", op)
+    if not m:
+        return False
+    lo, hi = int(m.group(1)), int(m.group(2))
+    return hi >= 1 and lo >= 1  # exigimos al menos 1 como mínimo (consumimos 1)
+
+def _adjust_op_minus_one(op: str) -> str:
+    """
+    Resta exactamente 1 byte al hueco del salto.
+    ONE_WILDCARD -> RANGE_0_0
+    RANGE_m_n    -> RANGE_{max(0,m-1)}_{max(0,n-1)}
+    """
+    opu = str(op).strip().upper()
+    if opu == "ONE_WILDCARD":
+        return "RANGE_0_0"
+    m = re.fullmatch(r"RANGE_(\d+)_(\d+)", opu)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        lo2 = max(0, lo - 1)
+        hi2 = max(0, hi - 1)
+        return f"RANGE_{lo2}_{hi2}"
+    return op  # desconocido: no tocamos
+
+def _collect_seq_nextops_by_group(conditions: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """
+    Devuelve: { group_key : { from_id : op_str } }
+    Donde group_key incluye:
+      - el nombre tal cual aparece en conditions
+      - y también su base en minúsculas (para empatar tras el fuse)
+    """
+    out: Dict[str, Dict[str, str]] = {}
+
+    def _add(g: str, f: str, op: str):
+        if not g or not f:
+            return
+        # clave con el nombre exacto
+        out.setdefault(g, {})[f] = op
+        # clave con la base en minúsculas (tras el fuse)
+        base = _base_name(g).lower()
+        out.setdefault(base, {})[f] = op
+
+    def _walk(node: Dict[str, Any]):
+        if "sequence" in node and isinstance(node["sequence"], dict):
+            seq = node["sequence"]
+            _add(str(seq.get("group", "")),
+                 str(seq.get("from", "")),
+                 str(seq.get("op", "")))
+        for k in ("or", "and"):
+            if k in node:
+                for sub in node[k]:
+                    _walk(sub)
+
+    for n in conditions or []:
+        _walk(n)
+
+    return out
+
+def _collect_edges_for_group_base(conditions: List[Dict[str, Any]], base: str) -> Dict[str, tuple[str, str]]:
+    edges: Dict[str, tuple[str, str]] = {}
+    for n in conditions or []:
+        if "sequence" in n and isinstance(n["sequence"], dict):
+            seq = n["sequence"]
+            g = str(seq.get("group", ""))
+            if _base_name(g).lower() == base:
+                f = str(seq.get("from", ""))
+                t = str(seq.get("to", ""))
+                op = str(seq.get("op", "RANGE_0_0"))
+                if f and t:
+                    edges[f] = (t, op)
+    return edges
+
+def _rebuild_sequences_cadena_by_base(conditions: List[Dict[str, Any]],
+                                      base: str,
+                                      kept_order: List[str],
+                                      dropped_sids: set,
+                                      seg_len_map: Dict[str, int]) -> List[Dict[str, Any]]:
+    # Usa el nombre original tal como aparece en conditions (para que luego remapee a gN)
+    orig_group_name = _first_group_name_for_base(conditions, base) or base
+
+    edges = _collect_edges_for_group_base(conditions, base)
+
+    # Elimina TODAS las sequence cuyo group tenga ese base
+    kept_nodes: List[Dict[str, Any]] = []
+    for n in conditions or []:
+        if "sequence" in n and isinstance(n["sequence"], dict):
+            g = str(n["sequence"].get("group", ""))
+            if _base_name(g).lower() == base:
+                continue
+        kept_nodes.append(n)
+
+    # Crea las nuevas sequence entre kept consecutivos (sumando gaps + bytes de dropeados intermedios)
+    new_seq_nodes: List[Dict[str, Any]] = []
+    for i in range(len(kept_order) - 1):
+        start = kept_order[i]
+        end   = kept_order[i+1]
+
+        cur = start
+        total_lo = 0
+        total_hi = 0
+        ok = True
+
+        while cur != end:
+            if cur not in edges:
+                ok = False
+                break
+            nxt, op = edges[cur]
+            lo, hi = _parse_op_to_range(op)
+            total_lo += lo; total_hi += hi
+            if nxt in dropped_sids:
+                L = seg_len_map.get(nxt, 0)
+                total_lo += L; total_hi += L
+            cur = nxt
+
+        if not ok:
+            if DEBUG_TOKENS:
+                print(f"[RG][WARN] No path {start}->{end} for base={base}. Skip.")
+            continue
+
+        new_op = _format_range(total_lo, total_hi)
+        new_seq_nodes.append({"sequence": {"group": orig_group_name, "from": start, "to": end, "op": new_op}})
+
+    return kept_nodes + new_seq_nodes
+
+
+_OP_RX = re.compile(r"^RANGE_(\d+)_(\d+)$")
+
+def _parse_op_to_range(op: str) -> tuple[int, int]:
+    if not isinstance(op, str):
+        return (0, 0)
+    opu = op.strip().upper()
+    if opu == "ONE_WILDCARD":
+        return (1, 1)
+    m = _OP_RX.fullmatch(opu)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (lo, hi)
+    # Desconocido -> conservador
+    return (0, 0)
+
+def _format_range(lo: int, hi: int) -> str:
+    lo = max(0, lo); hi = max(0, hi)
+    return f"RANGE_{lo}_{hi}"
+
+def _collect_edges_for_group(conditions: List[Dict[str, Any]], group_name: str) -> Dict[str, tuple[str, str]]:
+    """
+    Devuelve un grafo simple de aristas 'from' -> (to, op) SOLO del grupo dado.
+    Asume 1 salto por nodo 'from' (cadena típica).
+    """
+    edges: Dict[str, tuple[str, str]] = {}
+    for n in conditions or []:
+        if "sequence" in n and isinstance(n["sequence"], dict):
+            seq = n["sequence"]
+            if str(seq.get("group", "")) == group_name:
+                f = str(seq.get("from", ""))
+                t = str(seq.get("to", ""))
+                op = str(seq.get("op", "RANGE_0_0"))
+                if f and t:
+                    edges[f] = (t, op)
+    return edges
+
+def _enc_variants_for_hex7_absorb_right_from_hex(hex_text: str) -> List[List[Dict[str, str]]]:
+    """
+    Devuelve 256 variantes separadas (cada variante = 1 token firmado).
+    Además, si DEBUG_TOKENS, imprime los 256 tokens crudos que se usaron.
+    """
+    b7 = _hex_to_bytes(hex_text)
+    if len(b7) != 7:
+        return []
+
+    variants: List[List[Dict[str, str]]] = []
+    if DEBUG_TOKENS:
+        raw_tokens_8: List[bytes] = []
+
+    for x in range(256):
+        t8 = _ascii_lower_bytes_local(b7 + bytes([x]))  # token de 8 bytes que se ofusca
+        if DEBUG_TOKENS:
+            raw_tokens_8.append(t8)
+
+        ri_hex = obfuscate_token_fkh(t8)
+        sig_b64 = sign_data(ri_hex, _PRIVATE_KEY)
+        variants.append([{"ri": ri_hex, "sig": sig_b64}])
+
+    if DEBUG_TOKENS:
+        # Muestra los 256 tokens crudos usados para ofuscar
+        _dbg_dump_tokens("hex7absorb", hex_text, b7, raw_tokens_8)
+
+    return variants
 
 
 
 # ---------- Conditions remapping (original group names -> "g1","g2",...) ----------
+def _remap_condition_node(node: Dict[str, Any],
+                          name_map: Dict[str, str],
+                          sid_maps: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    def _to_gid(gname: str) -> str:
+        base = _base_name(str(gname)).lower()
+        return name_map.get(base, name_map.get(gname, gname))
 
-def _remap_condition_node(node: Dict[str, Any], name_map: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Recursively remap a condition node:
-      - {"groups":[<names>], "operator":"and|any|not"} -> replace names with gIDs
-      - {"or":[ <node>, ... ]}                         -> recurse
-      - {"and":[ <node>, ... ]}                        -> recurse (if present)
-      - {"sequence":{"group":name,"from":id,"to":id,"op":...}} -> remap group
-    """
     if "groups" in node:
-        remapped = [name_map.get(g, g) for g in node["groups"]]
+        remapped = [_to_gid(g) for g in node["groups"]]
         op = str(node.get("operator", "and")).strip().lower()
         if op == "any":
             op = "or"
         return {"groups": remapped, "operator": op}
+
     if "or" in node:
-        return {"or": [_remap_condition_node(x, name_map) for x in node["or"]]}
+        return {"or": [_remap_condition_node(x, name_map, sid_maps) for x in node["or"]]}
+
     if "and" in node:
-        return {"and": [_remap_condition_node(x, name_map) for x in node["and"]]}
+        return {"and": [_remap_condition_node(x, name_map, sid_maps) for x in node["and"]]}
+
     if "sequence" in node:
         seq = dict(node["sequence"])
-        seq["group"] = name_map.get(seq.get("group", ""), seq.get("group", ""))
+        orig_group = seq.get("group", "")
+        gid = _to_gid(orig_group)
+        seq["group"] = gid
+        sid_map = sid_maps.get(gid, {})
+        if "from" in seq:
+            seq["from"] = sid_map.get(seq["from"], seq["from"])
+        if "to" in seq:
+            seq["to"] = sid_map.get(seq["to"], seq["to"])
         return {"sequence": seq}
-    # Unknown shape: return as-is
+
     return dict(node)
+
 
 
 # --- Bucket merge (merge physical groups like url_1, url_2 → url) ---
@@ -430,43 +724,90 @@ def _ordered_group_names(groups_in: dict, conditions_in: list) -> list[str]:
     return seen + others
 
 # ---------- Rule conversion (one rule from input -> one anonymized rule object) ----------
-
 def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert one rule from the input dictionary into the anonymized format:
-      {
-        "groups": { "g1": {...}, "g2": {...}, ... },
-        "conditions": [ ... remapped ... ]
-      }
-    """
     rule_obj = _fuse_groups_by_base(rule_obj)
 
     groups_in: Dict[str, Any] = rule_obj.get("groups", {})
     conditions_in: List[Dict[str, Any]] = rule_obj.get("conditions", [])
 
-    # Map original group names -> opaque ids g1, g2, ...
     ordered_names = _ordered_group_names(groups_in, conditions_in)
-    
+
+    # 1) recolectar los 'op' por grupo (por nombre y por base)
+    seq_nextops_by_group = _collect_seq_nextops_by_group(conditions_in)
+
     name_map: Dict[str, str] = {}
     groups_out: Dict[str, Any] = {}
+    sid_maps: Dict[str, Dict[str, str]] = {}
+
+    # meta por grupo base (para reconstrucción de secuencias)
+    meta_by_base = {}  # base -> dict(absorbed_from, dropped_sids, seg_len_map, kept_order, orig_name)
 
     for idx, orig_name in enumerate(ordered_names, start=1):
         gobj = groups_in[orig_name]
         gid = f"g{idx}"
+        base = _base_name(orig_name).lower()
+
         name_map[orig_name] = gid
+        name_map[base] = gid
 
         mt_raw = gobj.get("match_type", "all")
         is_cadena = isinstance(mt_raw, str) and mt_raw.strip().lower() == "cadena"
         if is_cadena:
-            groups_out[gid] = _process_group_cadena(gobj)
+            seq_map = seq_nextops_by_group.get(orig_name, {}) or seq_nextops_by_group.get(base, {})
+            grp_out, sid_map, absorbed_from, dropped_sids, seg_len_map, kept_order = _process_group_cadena(gobj, gid, seq_map)
+            groups_out[gid] = grp_out
+            sid_maps[gid] = sid_map
+
+            meta_by_base[base] = {
+                "absorbed_from": absorbed_from,
+                "dropped_sids": dropped_sids,
+                "seg_len_map": seg_len_map,
+                "kept_order": kept_order,
+                "orig_name": orig_name,
+            }
         else:
             groups_out[gid] = _process_group_simple(gobj)
 
+    # 2) Ajuste por absorción (-1) sobre las conditions originales
+    conditions_adj = copy.deepcopy(conditions_in)
 
-    # Remap conditions to use our gIDs
-    conditions_out = [_remap_condition_node(c, name_map) for c in conditions_in]
+    def _adjust_inplace(node: Dict[str, Any]):
+        if "sequence" in node and isinstance(node["sequence"], dict):
+            seq = node["sequence"]
+            g = str(seq.get("group", ""))
+            f = str(seq.get("from", ""))
+            base = _base_name(g).lower()
+            if base in meta_by_base and f in meta_by_base[base]["absorbed_from"]:
+                seq["op"] = _adjust_op_minus_one(seq.get("op", ""))
+        elif "or" in node:
+            for sub in node["or"]:
+                _adjust_inplace(sub)
+        elif "and" in node:
+            for sub in node["and"]:
+                _adjust_inplace(sub)
+
+    for n in conditions_adj:
+        _adjust_inplace(n)
+
+    # 3) RECONSTRUIR secuencias para cada grupo 'cadena' con drops (<7B) sumando gaps + longitudes dropeadas
+    conditions_rebuilt = conditions_adj
+    for base, meta in meta_by_base.items():
+        if not meta["kept_order"]:
+            continue
+        conditions_rebuilt = _rebuild_sequences_cadena_by_base(
+            conditions_rebuilt,
+            base,
+            meta["kept_order"],
+            meta["dropped_sids"],
+            meta["seg_len_map"],
+        )
+
+
+    # 4) Remapear condiciones (grupo y from/to) a gN y gN_segM FINAL
+    conditions_out = [_remap_condition_node(c, name_map, sid_maps) for c in conditions_rebuilt]
 
     return {"groups": groups_out, "conditions": conditions_out}
+
 
 
 # ---------- Main: load dict -> build anonymized payload -> POST to MB ----------

@@ -14,7 +14,7 @@ rule Contains_VBA_macro_code
 
 	strings:
 		$officemagic = { D0 CF 11 E0 A1 B1 1A E1 }
-		$zipmagic = { 50 4B 03 04 }
+		$zipmagic = "PK"
 
 		$97str1 = "_VBA_PROJECT_CUR" wide
 		$97str2 = "VBAProject"

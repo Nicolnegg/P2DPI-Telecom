@@ -123,6 +123,15 @@ def upload_rules():
         "tokens": flat
     }
 
+    # --- DEBUG: vista previa de lo que se envía al Sender ---
+    try:
+        app.logger.debug("[MB→Sender] payload preview: total_tokens=%d", len(fanout_payload["tokens"]))
+        app.logger.debug("[MB→Sender] first_4k=\n%s",
+                         json.dumps(fanout_payload, indent=2, ensure_ascii=False)[:4000])
+    except Exception:
+        pass
+
+
     # Forward to Receiver (R)
     try:
         r_response = requests.post("http://localhost:10000/receive_rules", json=fanout_payload, timeout=5)
@@ -259,6 +268,19 @@ def _try_finalize_batch(batch_id: str):
     ruleset_in = state["ruleset"]
     revmap = state["revmap"]
     final_ruleset = rebuild_session_ruleset(ruleset_in, revmap, seq_to_sj)
+
+     # --- DEBUG: resumen de session_tokens por string ---
+    try:
+        app.logger.debug("[MB] session rebuild done")
+        for r_i, rr in enumerate(final_ruleset.get("rules", [])):
+            for gk, gv in (rr.get("groups") or {}).items():
+                for si, it in enumerate(gv.get("strings", [])):
+                    st = it.get("session_tokens", [])
+                    pos_ok = sum(1 for x in st if x)
+                    alts = sum(len(x if isinstance(x, list) else [x]) for x in st if x)
+                    app.logger.debug("  r%s/%s/s%s: posiciones=%s alternativas=%s", r_i, gk, si, pos_ok, alts)
+    except Exception:
+        pass
 
     # Publish
     global SESSION_RULES, RULESET_SESSION

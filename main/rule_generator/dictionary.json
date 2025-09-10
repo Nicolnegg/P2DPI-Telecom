@@ -10,9 +10,9 @@
       },
       "zipmagic": {
         "match_type": "all",
-        "data_type": "hex",
+        "data_type": "string",
         "strings": [
-          "50 4B 03 04"
+          "PK"
         ]
       },
       "97str": {

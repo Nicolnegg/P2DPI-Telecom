@@ -11,6 +11,8 @@ import json
 import os
 import struct
 import copy
+import re
+
 from typing import Dict, Tuple, List, Any
 
 # -------------------------
@@ -142,80 +144,84 @@ def h2_compute(prf: CDLL, counter_i: int, session_key_hex: str) -> str:
 
 def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int]]]:
     """
-    Flatten the incoming RG ruleset (encrypted tokens by groups) into a linear list
-    of {"seq", "obfuscated", "signature"} and build a reverse mapping to reconstruct.
-
-    Returns:
-      flat_tokens: [ {"seq": int, "obfuscated": "<ri-hex>", "signature": "<b64>"} , ...]
-      rev_map:     { seq: (rule_idx, group_key, string_idx, enc_idx) }
+    Aplana tokens soportando:
+      - enc_tokens con N alternativas (1 posición)
+      - varias posiciones como lista de wrappers con enc_tokens
+      - modo split_positions (cada {ri,sig} = 1 posición)
+    Para CADA POSICIÓN e_idx se añaden N filas (una por alternativa) con el MISMO e_idx.
     """
     flat_tokens = []
     rev_map: Dict[int, Tuple[int, str, int, int]] = {}
     seq = 0
 
-    rules = ruleset.get("rules", [])
-    for r_idx, rule in enumerate(rules):
-        groups = rule.get("groups", {})
-        for g_key, g_val in groups.items():
-            strings = g_val.get("strings", [])
-            for s_idx, s_item in enumerate(strings):
-                enc_list = s_item.get("enc_tokens")
-                if not enc_list:
-                    continue
-                for e_idx, entry in enumerate(enc_list):
-                    ri = entry.get("ri")
-                    sig = entry.get("sig")
-                    if not ri or not sig:
-                        continue
-                    flat_tokens.append({
-                        "seq": seq,
-                        "obfuscated": ri,
-                        "signature": sig
-                    })
-                    rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
-                    seq += 1
+    for r_idx, rule in enumerate((ruleset or {}).get("rules", [])):
+        for g_key, g_val in (rule.get("groups") or {}).items():
+            for s_idx, s_item in enumerate((g_val.get("strings") or [])):
+                positions = _extract_enc_positions_from_string_item(s_item)
+                if not positions:
+                    # compat: forma antigua {"enc_tokens":[...]} directamente
+                    enc_list = s_item.get("enc_tokens") if isinstance(s_item, dict) else None
+                    if isinstance(enc_list, list):
+                        positions = [[t for t in enc_list if isinstance(t, dict)]]
+
+                for e_idx, alts in enumerate(positions):
+                    for alt in alts:
+                        ri = alt.get("ri"); sig = alt.get("sig")
+                        if not ri or not sig:
+                            continue
+                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                        # ¡OJO! TODAS las alternativas comparten el MISMO e_idx (posición)
+                        rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
+                        seq += 1
 
     return flat_tokens, rev_map
 
 
+
+def _strip_enc_tokens_deep(obj):
+    if isinstance(obj, dict):
+        obj.pop("enc_tokens", None)
+        for k in list(obj.keys()):
+            v = obj[k]
+            _strip_enc_tokens_deep(v)
+            if isinstance(v, list):
+                obj[k] = [x for x in v if not (isinstance(x, dict) and len(x) == 0)]
+                if not obj[k]:
+                    obj.pop(k, None)
+    elif isinstance(obj, list):
+        for x in obj:
+            _strip_enc_tokens_deep(x)
+
 def rebuild_session_ruleset(ruleset_in: Dict[str, Any],
                             rev_map: Dict[int, Tuple[int, str, int, int]],
                             seq_to_sj: Dict[int, str]) -> Dict[str, Any]:
-    """
-    Replace each "enc_tokens" with "session_tokens" in a deep-copied ruleset.
-
-    Args:
-      ruleset_in:  original RG ruleset (dict).
-      rev_map:     seq -> (rule_idx, group_key, string_idx, enc_idx).
-      seq_to_sj:   seq -> Sj_hex.
-
-    Returns:
-      ruleset_out: deep-copied ruleset with "session_tokens" lists, "enc_tokens" removed.
-    """
     out = copy.deepcopy(ruleset_in)
     rules = out.get("rules", [])
 
+    # 1) agrupa por (r,g,s,posición) → lista de SJs (alternativas)
+    bucket: Dict[Tuple[int, str, int, int], List[str]] = {}
     for seq, sj_hex in seq_to_sj.items():
         r_idx, g_key, s_idx, e_idx = rev_map[seq]
-        group = rules[r_idx]["groups"][g_key]
-        strings = group.get("strings", [])
-        if s_idx >= len(strings):
-            continue
+        bucket.setdefault((r_idx, g_key, s_idx, e_idx), []).append(sj_hex)
 
-        item = strings[s_idx]
+    # 2) vuelca en session_tokens respetando POSICIONES y ALTERNATIVAS
+    for (r_idx, g_key, s_idx, e_idx), sjs in bucket.items():
+        group = rules[r_idx]["groups"][g_key]
+        item  = group["strings"][s_idx]
         sess_list = item.setdefault("session_tokens", [])
         while len(sess_list) <= e_idx:
             sess_list.append(None)
-        sess_list[e_idx] = {"sj": sj_hex}
 
-    # Drop original enc_tokens from all items
-    for rule in rules:
-        for g_key, g_val in rule.get("groups", {}).items():
-            for item in g_val.get("strings", []):
-                if "enc_tokens" in item:
-                    del item["enc_tokens"]
+        if len(sjs) == 1:
+            sess_list[e_idx] = {"sj": sjs[0]}
+        else:
+            sess_list[e_idx] = [{"sj": s} for s in sjs]
 
+    # 3) limpia cualquier rastro de enc_tokens
+    _strip_enc_tokens_deep(out)
     return out
+
+
 
 
 def pretty_print_ruleset(ruleset: Dict[str, Any]) -> str:
@@ -231,88 +237,54 @@ def pretty_print_ruleset(ruleset: Dict[str, Any]) -> str:
 # Runtime matching helpers
 # =========================
 
-def build_runtime_index(final_ruleset: Dict[str, Any]):
-    """
-    Build runtime structures for fast matching:
-      - 'runtime': per rule -> per group -> list of strings with their ordered Sj tokens and run state.
-      - 'sj_to_targets': map Sj (lower) -> list of (rule_idx, group_key, string_idx, token_pos).
-    This lets us update only the affected strings when an Sj matches a Ti at position i.
-    """
-    runtime = {"rules": []}
-    sj_to_targets = {}  # sj_hex_lower -> [(r_idx, g_key, s_idx, pos), ...]
-
-    rules = (final_ruleset or {}).get("rules", [])
-    for r_idx, rule in enumerate(rules):
-        r_entry = {"groups": {}, "conditions": rule.get("conditions", [])}
-        for g_key, g_val in (rule.get("groups") or {}).items():
-            raw_mt = g_val.get("match_type", "any")
-            mt_norm = _coerce_match_type(raw_mt)  
-            g_entry = {
-                "match_type": mt_norm,   # keep as-is for snapshot/debug
-                "threshold": None,      # we’ll set this after we know total_strings
-                "strings": []
-            }
-            for s_idx, s_item in enumerate(g_val.get("strings", [])):
-                sess_list = s_item.get("session_tokens", [])
-                sj_list = []
-                for pos, token in enumerate(sess_list):
-                    if not token:
-                        continue
-                    sj_hex = (token.get("sj") or "").strip()
-                    if not sj_hex:
-                        continue
-                    sj_list.append(sj_hex)
-                    sj_to_targets.setdefault(sj_hex.lower(), []).append((r_idx, g_key, s_idx, pos))
-
-                g_entry["strings"].append({
-                    "sj_list": sj_list,       # ordered session tokens for the string
-                    "need_consecutive": True, # require contiguous i positions for long strings
-                    "run_len": 0,             # how many tokens matched consecutively from start
-                    "last_hit_i": None,       # last traffic index i that matched
-                    "done": False             # whole string satisfied
-                })
-            total_strings = len(g_entry["strings"])
-            _mode, k = _normalize_match_type(mt_norm, total_strings) 
-            # We only need K for evaluation because the only policy we support is "at least K"
-            g_entry["threshold"] = k
-            r_entry["groups"][g_key] = g_entry
-        runtime["rules"].append(r_entry)
-
-    return runtime, sj_to_targets
-
 
 def reset_runtime_state(runtime):
     """Reset per-string run state (useful if you reuse the runtime across requests/batches)."""
     if not runtime:
         return
     for r in runtime.get("rules", []):
+        # reset strings
         for g in r.get("groups", {}).values():
             for s in g.get("strings", []):
                 s["run_len"] = 0
                 s["last_hit_i"] = None
+                s["cur_start_i"] = None
+                s["bound_edge"] = None
+                s["just_done_at"] = None
                 s["done"] = False
+        # reset edges
+        for e in r.get("seq_edges", []):
+            e["pending"] = None
+            e["satisfied"] = False
+
 
 
 def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
     """
-    Update run-state for a string when we observed a match for its token at position 'token_pos'
-    at traffic index 'traffic_i'. We require ordered and consecutive matches:
-      sj_list[0] at i, sj_list[1] at i+1, ..., sj_list[m] at i+m.
+    Actualiza el estado de un *string* cuando su token en 'token_pos' hace match en el índice i.
+    Requiere matches consecutivos (i, i+1, ...). Anota:
+      - cur_start_i: dónde comenzó esta corrida
+      - just_done_at: i en el cual terminó el string completo
     """
     if s_state["done"]:
         return
 
-    expected = s_state["run_len"]  # next expected token_pos
+    expected = s_state.get("run_len", 0)
 
-    # Start of the sequence?
+    # Arranque (pos 0)
     if token_pos == 0:
         s_state["run_len"] = 1
         s_state["last_hit_i"] = traffic_i
+        s_state["cur_start_i"] = traffic_i
+        s_state["bound_edge"] = None          
         if len(s_state["sj_list"]) == 1:
-            s_state["done"] = True  # single-token strings (incl. short strings)
+            s_state["done"] = True
+            s_state["just_done_at"] = traffic_i
+        else:
+            s_state["just_done_at"] = None
         return
 
-    # In-order next token?
+    # Siguiente esperado en orden
     if token_pos == expected:
         contiguous = (s_state["last_hit_i"] is None) or (traffic_i == s_state["last_hit_i"] + 1)
         if (not s_state["need_consecutive"]) or contiguous:
@@ -320,72 +292,145 @@ def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
             s_state["last_hit_i"] = traffic_i
             if s_state["run_len"] == len(s_state["sj_list"]):
                 s_state["done"] = True
+                s_state["just_done_at"] = traffic_i
+            else:
+                s_state["just_done_at"] = None
         else:
-            # Gap: reset; allow start if this token is first in sequence
-            s_state["run_len"] = 1 if token_pos == 0 else 0
-            s_state["last_hit_i"] = traffic_i if token_pos == 0 else None
-    else:
-        # Out of order: only treat as fresh start if token_pos == 0
-        if token_pos == 0:
+            # hubo hueco: reinicia desde aquí
             s_state["run_len"] = 1
             s_state["last_hit_i"] = traffic_i
-            if len(s_state["sj_list"]) == 1:
-                s_state["done"] = True
+            s_state["cur_start_i"] = traffic_i
+            s_state["bound_edge"] = None      
+            s_state["done"] = (len(s_state["sj_list"]) == 1)
+            s_state["just_done_at"] = (traffic_i if s_state["done"] else None)
+        return
+
+    # Cualquier otro caso (out-of-order)
+    if token_pos == 0:
+        s_state["run_len"] = 1
+        s_state["last_hit_i"] = traffic_i
+        s_state["cur_start_i"] = traffic_i
+        s_state["bound_edge"] = None 
+        s_state["done"] = (len(s_state["sj_list"]) == 1)
+        s_state["just_done_at"] = (traffic_i if s_state["done"] else None)
+    else:
+        s_state["run_len"] = 0
+        s_state["last_hit_i"] = None
+        s_state["cur_start_i"] = None
+        s_state["bound_edge"] = None
+        s_state["just_done_at"] = None
+        s_state["done"] = False
+
+
+def _extract_enc_positions_from_string_item(s_item):
+    """
+    Devuelve POSICIONES con alternativas, SIN colapsar wrappers:
+      positions = [
+        [ {ri,sig}, {ri,sig}, ... ],   # pos 0 (N alternativas)
+        [ {ri,sig}, ... ],             # pos 1
+        ...
+      ]
+
+    Soporta:
+      a) {"enc_tokens":[ {...},{...}, ... ]}                       -> 1 posición con N alternativas
+         NUEVO: si "split_positions": true  o  "enc_tokens_mode":"positions"
+                entonces CADA {ri,sig} es SU PROPIA POSICIÓN.
+
+      b) {"id":"...", ANY_LIST : [ {"enc_tokens":[...]}, ... ]}    -> CADA wrapper es UNA POSICIÓN
+      c) [ {"enc_tokens":[...]}, {"enc_tokens":[...]} ]            -> CADA wrapper es UNA POSICIÓN
+      d) listas de {ri,sig} directas                               -> 1 posición con N alternativas
+    """
+    def _norm_list(lst):
+        return [t for t in (lst or []) if isinstance(t, dict) and t.get("ri") and t.get("sig")]
+
+    positions = []
+
+    if isinstance(s_item, dict) and isinstance(s_item.get("enc_tokens"), list):
+        toks = _norm_list(s_item["enc_tokens"])
+        if not toks:
+            return positions
+        split_flag = bool(s_item.get("split_positions"))
+        mode = str(s_item.get("enc_tokens_mode", "") or "").strip().lower()
+        if split_flag or mode == "positions":
+            for t in toks:
+                positions.append([t])          # 1 alternativa por posición
         else:
-            s_state["run_len"] = 0
-            s_state["last_hit_i"] = None
+            positions.append(toks)             # 1 posición con N alternativas
+        return positions
 
-def _eval_condition_node(node: dict, g_truth: dict) -> tuple[bool, dict | None]:
-    """
-    Recursively evaluate a condition node against the current group truth map.
+    if isinstance(s_item, dict):
+        for k, v in s_item.items():
+            if k == "id" or not isinstance(v, list):
+                continue
+            wrappers = [w for w in v if isinstance(w, dict) and isinstance(w.get("enc_tokens"), list)]
+            if wrappers:
+                for w in wrappers:
+                    toks = _norm_list(w.get("enc_tokens"))
+                    if toks:
+                        positions.append(toks)
+                continue
+            direct = _norm_list(v)
+            if direct:
+                positions.append(direct)
+        return positions
 
-    Supported shapes:
-      - {"groups":[...], "operator":"and"|"or"|"not"}  # base clause
-      - {"or": [ <node>, <node>, ... ]}               # wrapper OR
-      - {"and":[ <node>, <node>, ... ]}               # wrapper AND
+    if isinstance(s_item, list):
+        wrappers = [w for w in s_item if isinstance(w, dict) and isinstance(w.get("enc_tokens"), list)]
+        if wrappers:
+            for w in wrappers:
+                toks = _norm_list(w.get("enc_tokens"))
+                if toks:
+                    positions.append(toks)
+            return positions
+        direct = _norm_list(s_item)
+        if direct:
+            positions.append(direct)
+        return positions
 
-    Returns: (ok, matched_node)
-      - ok: boolean result for this node
-      - matched_node: the base clause (or wrapper) that evaluated True (for debugging)
-    """
+    return positions
+
+
+
+def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool, dict | None]:
     if not isinstance(node, dict):
         return False, None
 
-    # Wrapper: OR of subnodes
     if "or" in node:
         for sub in node.get("or", []):
-            ok, m = _eval_condition_node(sub, g_truth)
+            ok, m = _eval_condition_node(sub, g_truth, r_entry)
             if ok:
                 return True, (m if m is not None else sub)
         return False, None
 
-    # Wrapper: AND of subnodes
     if "and" in node:
-        ok_all = True
-        last_true = None
+        ok_all, last_true = True, None
         for sub in node.get("and", []):
-            ok, m = _eval_condition_node(sub, g_truth)
+            ok, m = _eval_condition_node(sub, g_truth, r_entry)
             if not ok:
                 ok_all = False
             else:
                 last_true = m if m is not None else sub
         return ok_all, (last_true if ok_all else None)
 
-    # Base clause: groups + operator
+    # NUEVO: sequence (usa satisfied del edge)
+    if "sequence" in node and isinstance(node["sequence"], dict):
+        s = node["sequence"]
+        gid = str(s.get("group",""))
+        fid = str(s.get("from",""))
+        tid = str(s.get("to",""))
+        lo, hi = _parse_sequence_op(s.get("op",""))
+        for e in r_entry.get("seq_edges", []):
+            if e["group"] == gid and e["from_id"] == fid and e["to_id"] == tid and e["lo"] == lo and e["hi"] == hi:
+                return (bool(e.get("satisfied")), node if e.get("satisfied") else None)
+        return (False, None)
+
+    # Base: groups
     op = (node.get("operator") or "and").lower()
     groups = node.get("groups", [])
     vals = [g_truth.get(k, False) for k in groups]
-
-    if op == "and":
-        ok = all(vals)
-    elif op == "or":
-        ok = any(vals)
-    elif op == "not":
-        ok = not any(vals)
-    else:
-        ok = False
-
+    ok = (all(vals) if op == "and" else any(vals) if op == "or" else (not any(vals) if op == "not" else False))
     return ok, node
+
 
 
 
@@ -396,18 +441,10 @@ def process_encrypted_tokens_with_conditions(prf,
                                              sj_to_targets: Dict[str, list],
                                              h2_func) -> tuple[bool, dict | None]:
     """
-    Scan encrypted traffic (Ti) against all Sj, but apply at most ONE update
-    per string per traffic index i to avoid out-of-order self-resets when the
-    same Sj appears at multiple positions (e.g., pos=1 and pos=17) inside the
-    same long string.
-
-    Selection policy for each string at index i:
-      1) If the next expected position 'expected' (run_len) is present in hits -> use that.
-      2) Else, if position 0 is present -> start/restart from 0.
-      3) Else, ignore other hits for this string at this i (do NOT reset).
-
-    After applying updates for all strings at this i, evaluate groups+conditions.
-    Return (True, details) if a rule is satisfied; else (False, None).
+    Escanea Ti vs todos los Sj, con gating de 'sequence':
+      - Un 'to' sólo puede arrancar (pos 0) si existe un edge pendiente con ready_i<=i<=deadline_i.
+      - Cuando 'from' termina, se crea el pending con ventana [ready_i, deadline_i].
+      - Cuando 'to' termina (y estaba ligado a ese edge), se marca satisfied=True.
     """
     if not runtime or not sj_to_targets:
         return False, None
@@ -417,23 +454,29 @@ def process_encrypted_tokens_with_conditions(prf,
         if not ti_low:
             continue
 
-        # --- Phase A: collect hits PER STRING for this traffic index i ---
-        # Keyed by (rule_idx, group_key, string_idx) -> set of matched positions {pos, ...}
-        per_string_hits: Dict[tuple, set] = {}
+        # ---- Fase 0: expirar pendings cuyo deadline ya pasó ----
+        for r_entry in runtime.get("rules", []):
+            for e_idx, e in enumerate(r_entry.get("seq_edges", [])):
+                p = e.get("pending")
+                if p and (i > p["deadline_i"]) and (not e.get("satisfied")):
+                    e["pending"] = None
+                    # liberar vínculos obsoletos de 'to' ligados a este edge
+                    for g in r_entry.get("groups", {}).values():
+                        for s in g.get("strings", []):
+                            if s.get("bound_edge") == e_idx and not s.get("done"):
+                                s["bound_edge"] = None
 
-        # Try every Sj we know: compute H2(c+i, Sj) and compare with Ti
-        # (This can be optimized later with caching/indexing if needed.)
+        # ---- Fase A: recolectar hits por string en este i ----
+        per_string_hits: Dict[tuple, set] = {}
         for sj_low, targets in sj_to_targets.items():
             h2_val = h2_func(prf, counter + i, sj_low)
             if h2_val.lower() != ti_low:
                 continue
             for (r_idx, g_key, s_idx, pos) in targets:
                 key = (r_idx, g_key, s_idx)
-                if key not in per_string_hits:
-                    per_string_hits[key] = set()
-                per_string_hits[key].add(pos)
+                per_string_hits.setdefault(key, set()).add(pos)
 
-        # --- Phase B: for each string, apply at most ONE update with priority rules ---
+        # ---- Fase B: aplicar como mucho UN update por string, con gating pos0 ----
         for (r_idx, g_key, s_idx), poses in per_string_hits.items():
             s_state = runtime["rules"][r_idx]["groups"][g_key]["strings"][s_idx]
             if s_state.get("done"):
@@ -441,21 +484,66 @@ def process_encrypted_tokens_with_conditions(prf,
 
             expected = s_state.get("run_len", 0)
 
-            # 1) Prefer the exact next expected position
+            # 1) preferimos el siguiente esperado
             if expected in poses:
                 _update_string_run_state(s_state, token_pos=expected, traffic_i=i)
                 continue
 
-            # 2) Otherwise, if we can (re)start from pos 0, do that
+            # 2) si hay pos0, sólo permitimos arrancar si pasa el gating por sequence
             if 0 in poses:
+                r_entry = runtime["rules"][r_idx]
+                by_to = r_entry.get("seq_by_to", {}).get(g_key, {})
+                to_edges = by_to.get(s_idx, [])
+
+                allow_start = True
+                chosen_edge = None
+                if to_edges:
+                    allow_start = False
+                    for edge_idx in to_edges:
+                        e = r_entry["seq_edges"][edge_idx]
+                        p = e.get("pending")
+                        if p and (p["ready_i"] <= i <= p["deadline_i"]) and (not e.get("satisfied")):
+                            allow_start = True
+                            chosen_edge = edge_idx
+                            break
+
+                if not allow_start:
+                    continue  # ignoramos el intento de arranque fuera de ventana
+
                 _update_string_run_state(s_state, token_pos=0, traffic_i=i)
+                if chosen_edge is not None and s_state["run_len"] == 1:
+                    s_state["bound_edge"] = chosen_edge
                 continue
 
-            # 3) Ignore any other out-of-order positions at this i (do NOT reset here)
-            #    This prevents self-sabotage when the same 8B window repeats later in the string.
-            #    No call to _update_string_run_state in this branch.
+            # 3) ignorar otros _poses_ (evita autosabotaje por repeticiones)
+            # (no llamamos a _update_string_run_state)
 
-        # --- Evaluate after processing all strings for this i ---
+        # ---- Fase C: disparadores por strings que ACABAN justo en este i ----
+        # a) Cuando 'from' termina, activar pending(ready_i, deadline_i)
+        # b) Cuando 'to' termina y estaba ligado a un edge, marcar satisfied=True
+        for r_entry in runtime.get("rules", []):
+            for g_key2, g2 in r_entry.get("groups", {}).items():
+                # a) from -> pending
+                by_from = r_entry.get("seq_by_from", {}).get(g_key2, {})
+                for s_idx2, s2 in enumerate(g2.get("strings", [])):
+                    if s2.get("just_done_at") == i:
+                        for edge_idx in by_from.get(s_idx2, []):
+                            e = r_entry["seq_edges"][edge_idx]
+                            # 'i' es el índice del ÚLTIMO token de 'from' (terminó justo en i)
+                            ready = i + 1 + e["lo"]
+                            deadl = i + 1 + e["hi"]
+                            e["pending"] = {"ready_i": ready, "deadline_i": deadl}
+
+                # b) to -> satisfied
+                for s_idx2, s2 in enumerate(g2.get("strings", [])):
+                    if s2.get("just_done_at") == i and s2.get("bound_edge") is not None:
+                        edge_idx = s2["bound_edge"]
+                        e = r_entry["seq_edges"][edge_idx]
+                        e["satisfied"] = True
+                        e["pending"] = None
+                        s2["bound_edge"] = None
+
+        # ---- Fase D: evaluar reglas/condiciones (groups + sequences) ----
         hit, det = _eval_groups_and_conditions_with_details(runtime)
         if hit:
             det = det or {}
@@ -463,7 +551,7 @@ def process_encrypted_tokens_with_conditions(prf,
             det["snapshot"] = snapshot_rule_status(runtime)
             return True, det
 
-    # No rule satisfied across all tokens. Return a snapshot for debugging.
+    # Nada disparó
     return False, {"snapshot": snapshot_rule_status(runtime)}
 
 
@@ -488,58 +576,41 @@ def _group_truth_map(rule_entry):
     return out
 
 def _eval_groups_and_conditions(runtime) -> bool:
-    """
-    Returns True if any rule has its conditions satisfied.
-    """
     if not runtime:
         return False
-
     for r in runtime.get("rules", []):
-        # Build per-group truth map
+        # map por grupos
         g_truth = {}
         for g_key, g in r.get("groups", {}).items():
             strs = g.get("strings", [])
-            if not strs:
-                g_truth[g_key] = False
-                continue
-            done_count = sum(1 for s in strs if s.get("done"))
             k = g.get("threshold", 1)
+            done_count = sum(1 for s in strs if s.get("done"))
             g_truth[g_key] = (done_count >= k)
 
         conds = r.get("conditions", [])
         if not conds:
-            # Default: ALL groups must be True
             if g_truth and all(g_truth.values()):
                 return True
             continue
 
-        # Evaluate each top-level condition node (OR-of-clauses structure allowed)
         for cond in conds:
-            ok, _ = _eval_condition_node(cond, g_truth)
+            ok, _ = _eval_condition_node(cond, g_truth, r)  # <-- pasa r
             if ok:
                 return True
-
     return False
 
 def _eval_groups_and_conditions_with_details(runtime):
-    """
-    Like _eval_groups_and_conditions, but returns (hit, details) with
-    the clause that matched.
-    """
     if not runtime:
         return False, None
-
     for r_idx, r in enumerate(runtime.get("rules", [])):
         g_truth = _group_truth_map(r)
         conds = r.get("conditions", [])
-
         if not conds:
             if g_truth and all(g_truth.values()):
                 return True, {"rule_idx": r_idx, "clause_idx": None, "g_truth": g_truth, "cond": None}
             continue
-
         for c_idx, cond in enumerate(conds):
-            ok, matched = _eval_condition_node(cond, g_truth)
+            ok, matched = _eval_condition_node(cond, g_truth, r)  # <-- pasa r
             if ok:
                 return True, {
                     "rule_idx": r_idx,
@@ -547,7 +618,6 @@ def _eval_groups_and_conditions_with_details(runtime):
                     "g_truth": g_truth,
                     "cond": matched
                 }
-
     return False, None
 
 
@@ -632,4 +702,117 @@ def snapshot_rule_status(runtime):
             }
         snap.append({"rule_idx": r_idx, "groups": gstat, "conditions": r.get("conditions", [])})
     return snap
+#--------------------------------------
+
+# --- helpers mínimas para sequences (si ya las tienes definidas, omite estas) ---
+_SEQ_OP_RX = re.compile(r"^RANGE_(\d+)_(\d+)$")
+def _parse_sequence_op(op: str) -> Tuple[int, int]:
+    if not isinstance(op, str):
+        return (0, 0)
+    s = op.strip().upper()
+    if s == "ONE_WILDCARD":
+        return (1, 1)
+    m = _SEQ_OP_RX.fullmatch(s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return (0, 0)
+
+def _gather_sequence_edges(conditions: List[dict]) -> List[dict]:
+    """
+    Extrae edges de tipo sequence a forma canónica:
+      [{"group","from_id","to_id","lo","hi"}, ...]
+    """
+    out = []
+    def walk(n):
+        if not isinstance(n, dict):
+            return
+        if "sequence" in n and isinstance(n["sequence"], dict):
+            s = n["sequence"]
+            lo, hi = _parse_sequence_op(s.get("op", ""))
+            out.append({
+                "group":   str(s.get("group", "")),
+                "from_id": str(s.get("from", "")),
+                "to_id":   str(s.get("to", "")),
+                "lo": lo, "hi": hi
+            })
+        for k in ("and", "or"):
+            if k in n:
+                for sub in n[k]:
+                    walk(sub)
+    for c in (conditions or []):
+        walk(c)
+    return out
+# -------------------------------------------------------------------------------
+
+def build_runtime_index(final_ruleset: Dict[str, Any]):
+    runtime = {"rules": []}
+    sj_to_targets: Dict[str, List[Tuple[int, str, int, int]]] = {}
+
+    rules = (final_ruleset or {}).get("rules", [])
+    for r_idx, rule in enumerate(rules):
+        r_entry = {
+            "groups": {},
+            "conditions": rule.get("conditions", []),
+            "seq_edges": [],
+            "seq_by_to": {},
+            "seq_by_from": {}
+        }
+
+        for g_key, g_val in (rule.get("groups") or {}).items():
+            mt_norm = _coerce_match_type(g_val.get("match_type", "any"))
+            g_entry = {
+                "match_type": mt_norm,
+                "threshold": None,
+                "strings": [],
+                "seg_index": {}
+            }
+
+            for s_idx, s_item in enumerate(g_val.get("strings", [])):
+                seg_id = s_item.get("id")
+                sess_list = s_item.get("session_tokens", [])
+
+                # Longitud lógica: número de posiciones (no alternativas)
+                pos_count = len(sess_list)
+
+                # Indexa TODAS las alternativas por posición
+                for pos, token in enumerate(sess_list):
+                    if not token:
+                        continue
+                    alts = token if isinstance(token, list) else [token]
+                    for alt in alts:
+                        sj_hex = (alt.get("sj") or "").strip() if isinstance(alt, dict) else ""
+                        if not sj_hex:
+                            continue
+                        sj_to_targets.setdefault(sj_hex.lower(), []).append((r_idx, g_key, s_idx, pos))
+
+                # placeholder para compat (se usa pos_count realmente)
+                sj_placeholder = [None] * pos_count
+                byte_len = max(8, pos_count + 7)
+
+                g_entry["strings"].append({
+                    "seg_id": seg_id,
+                    "sj_list": sj_placeholder,   # sólo marcador
+                    "pos_count": pos_count,      # ← usar esta
+                    "need_consecutive": True,
+                    "byte_len": byte_len,
+                    "run_len": 0,
+                    "last_hit_i": None,
+                    "cur_start_i": None,
+                    "bound_edge": None,
+                    "just_done_at": None,
+                    "done": False
+                })
+                if seg_id:
+                    g_entry["seg_index"][seg_id] = s_idx
+
+            _mode, k = _normalize_match_type(mt_norm, len(g_entry["strings"]))
+            g_entry["threshold"] = k
+            r_entry["groups"][g_key] = g_entry
+
+        # (si ya tienes resolución de sequences, vuelve a engancharla aquí)
+        runtime["rules"].append(r_entry)
+
+    return runtime, sj_to_targets
+
+
 

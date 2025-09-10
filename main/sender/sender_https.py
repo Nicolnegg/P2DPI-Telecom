@@ -254,7 +254,7 @@ def trigger_test_client_request():
     #     "</w:document>\n"
     # )
 
-    #Maldoc_VBA_macro_code
+    #Maldoc_VBA_macro_code - rule 1 
     # fake_email = (
     #     b"From: billing@corp.local\n"
     #     b"To: user@example.com\n"
@@ -264,14 +264,34 @@ def trigger_test_client_request():
     #     b"\x41\x74\x74\x72\x69\x62\x75\x74\x00\x65\x20\x56\x42\x5F"
     # )
 
+    #Maldoc_VBA_macro_code - rule 2
     fake_email= (
         b"From: billing@corp.local\n"
         b"To: user@example.com\n"
         b"Subject: ZIP VBA macro test\n"
         b"\n"
-        b"\x50\x4B\x03\x04\x14\x00\x06\x00\n"
+        b"\x50\x4B\x03\x04\x14\x00\x08\x00\n"
         b"vbaProject.bin\n"
     )
+
+    #WShell_ChinaChopper-rule1-1
+    fake_email= (
+        b"From: billing@corp.local\n"
+        b"To: user@example.com\n"
+        b"Subject: ChinaChopper ASPX test (len=10)\n"
+        b"\n"
+        b"\x25\x40\x20\x50\x61\x67\x65\x20\x4C\x61\x6E\x67\x75\x61\x67\x65\x3D"
+        b"\x30"
+        b"\x4A\x73\x63\x72\x31\x70\x74"
+        b"\x55"
+        b"\x25\x3E\x3C\x25\x65\x76\x61\x6C\x28\x52\x65\x71\x75\x65\x73\x74\x2E\x49\x74\x65\x6D\x5B"
+        b"\x70\x61\x73\x73\x77\x6F\x72\x64\x22\x5D"
+    )
+
+    #WShell_ChinaChopper-rule1-2
+    #fake_email = b"From: billing@corp.local\nTo: user@example.com\nSubject: ChinaChopper ASPX one-liner\n\n%@ Page Language=\"Jscript\"%><%eval(Request.Item[XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXunsafe)%>\n"
+
+
 
     data = (
         "username=alice"
