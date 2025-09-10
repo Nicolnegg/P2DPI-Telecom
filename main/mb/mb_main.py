@@ -108,6 +108,14 @@ def upload_rules():
     batch_id = str(uuid.uuid4())
     flat, rev_map = flatten_ruleset_from_rg(ruleset)
 
+    # --- DEBUG: forma del rev_map en el upload ---
+    try:
+        any_addr = next(iter(rev_map.values()))
+        app.logger.debug("[MB] rev_map(sample) at upload len=%s val=%s (total=%d)",
+                        len(any_addr), any_addr, len(rev_map))
+    except StopIteration:
+        app.logger.debug("[MB] rev_map empty at upload")
+
     BATCHES[batch_id] = {
         "ruleset": ruleset,
         "flat": flat,
@@ -267,6 +275,14 @@ def _try_finalize_batch(batch_id: str):
     # Rebuild structured ruleset
     ruleset_in = state["ruleset"]
     revmap = state["revmap"]
+    # --- DEBUG: forma del rev_map al finalizar ---
+    try:
+        any_addr = next(iter(revmap.values()))
+        app.logger.debug("[MB] rev_map(sample) at finalize len=%s val=%s (total=%d)",
+                        len(any_addr), any_addr, len(revmap))
+    except StopIteration:
+        app.logger.debug("[MB] rev_map empty at finalize")
+        
     final_ruleset = rebuild_session_ruleset(ruleset_in, revmap, seq_to_sj)
 
      # --- DEBUG: resumen de session_tokens por string ---

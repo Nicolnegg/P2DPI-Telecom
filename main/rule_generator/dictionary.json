@@ -56,51 +56,5 @@
         "operator": "and"
       }
     ]
-  },
-  "webshell_ChinaChopper_php": {
-    "groups": {
-      "ChinaChopperPHP": {
-        "match_type": "cadena",
-        "data_type": "hex",
-        "strings": [
-          {
-            "id": "ChinaChopperPHP_s0",
-            "value": "3C 3F 70 68 70 20 40 65 76 61 6C 28 24 5F 50 4F 53 54 5B"
-          },
-          {
-            "id": "ChinaChopperPHP_s1",
-            "value": "70 61 73 73 77 6F 72 64"
-          },
-          {
-            "id": "ChinaChopperPHP_s2",
-            "value": "5D 29 3B 3F 3E"
-          }
-        ]
-      }
-    },
-    "conditions": [
-      {
-        "sequence": {
-          "group": "ChinaChopperPHP",
-          "from": "ChinaChopperPHP_s0",
-          "to": "ChinaChopperPHP_s1",
-          "op": "ONE_WILDCARD"
-        }
-      },
-      {
-        "sequence": {
-          "group": "ChinaChopperPHP",
-          "from": "ChinaChopperPHP_s1",
-          "to": "ChinaChopperPHP_s2",
-          "op": "ONE_WILDCARD"
-        }
-      },
-      {
-        "groups": [
-          "ChinaChopperPHP"
-        ],
-        "operator": "and"
-      }
-    ]
   }
 }

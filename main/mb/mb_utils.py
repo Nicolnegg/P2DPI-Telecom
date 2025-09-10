@@ -15,9 +15,14 @@ import re
 
 from typing import Dict, Tuple, List, Any
 
+
+# Tamaño del bloque con el que viaja el tráfico (en bytes)
+BLOCK_BYTES = int(os.environ.get("MB_BLOCK_BYTES", "8"))
+
 # -------------------------
 # PRF loader and signatures
 # -------------------------
+
 
 def load_prf(shared_dir: str = None) -> CDLL:
     """
@@ -142,82 +147,68 @@ def h2_compute(prf: CDLL, counter_i: int, session_key_hex: str) -> str:
 # Rule-set shaping helpers
 # -------------------------
 
-def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int]]]:
-    flat_tokens = []
-    rev_map: Dict[int, Tuple[int, str, int, int]] = {}
-    seq = 0
-    rules = (ruleset or {}).get("rules", [])
-
-    for r_idx, rule in enumerate(rules):
-        for g_key, g_val in (rule.get("groups") or {}).items():
-            for s_idx, s_item in enumerate(g_val.get("strings", [])):
-                enc_list = s_item.get("enc_tokens")
-                if not enc_list:
-                    continue
-                for e_idx, entry in enumerate(enc_list):
-                    if isinstance(entry, dict):
-                        ri, sig = entry.get("ri"), entry.get("sig")
-                        if not ri or not sig: 
-                            continue
-                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
-                        rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
-                        seq += 1
-                    elif isinstance(entry, list):
-                        # múltiples alternativas para el MISMO e_idx
-                        for alt in entry:
-                            if not isinstance(alt, dict): 
-                                continue
-                            ri, sig = alt.get("ri"), alt.get("sig")
-                            if not ri or not sig: 
-                                continue
-                            flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
-                            rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
-                            seq += 1
-    return flat_tokens, rev_map
-
-
-
 def rebuild_session_ruleset(ruleset_in: Dict[str, Any],
-                            rev_map: Dict[int, Tuple[int, str, int, int]],
+                            rev_map: Dict[int, Tuple],
                             seq_to_sj: Dict[int, str]) -> Dict[str, Any]:
     out = copy.deepcopy(ruleset_in)
     rules = out.get("rules", [])
 
-    for seq, sj_hex in seq_to_sj.items():
-        r_idx, g_key, s_idx, e_idx = rev_map[seq]
-        group = rules[r_idx]["groups"][g_key]
-        strings = group.get("strings", [])
-        if s_idx >= len(strings):
+    # 1) Volcar cada Sj en su contenedor correcto (directo o "hijo")
+    for seq, sj_hex in (seq_to_sj or {}).items():
+        if seq not in rev_map:
             continue
-        item = strings[s_idx]
-        sess_list = item.setdefault("session_tokens", [])
-        while len(sess_list) <= e_idx:
-            sess_list.append(None)
-
-        new_tok = {"sj": sj_hex}
-        if sess_list[e_idx] is None:
-            sess_list[e_idx] = new_tok                               # primera alternativa
-        elif isinstance(sess_list[e_idx], dict):
-            sess_list[e_idx] = [sess_list[e_idx], new_tok]           # convertir a lista
-        elif isinstance(sess_list[e_idx], list):
-            sess_list[e_idx].append(new_tok)                         # agregar alternativa
+        addr = rev_map[seq]
+        # Acepta 4 o 5 campos
+        if isinstance(addr, (list, tuple)) and len(addr) == 5:
+            r_idx, g_key, s_outer_idx, s_inner_idx, pos_idx = addr
+        elif isinstance(addr, (list, tuple)) and len(addr) == 4:
+            r_idx, g_key, s_outer_idx, pos_idx = addr
+            s_inner_idx = -1
         else:
-            sess_list[e_idx] = [new_tok]
+            continue
 
-    # 🔴 Comprobación de faltantes (opcional pero recomendable)
-    expected = set(rev_map.values())
-    resolved = set(rev_map[seq] for seq in seq_to_sj.keys())
-    missing = expected - resolved
-    if missing:
-        raise RuntimeError(f"[MB] Faltan {len(missing)} session_tokens; ej: {list(missing)[:5]}")
+        group = rules[r_idx]["groups"][g_key]
+        outer_list = group.setdefault("strings", [])
+        if s_outer_idx >= len(outer_list):
+            continue
 
-    # Elimina SIEMPRE enc_tokens del ruleset final
-    for rule in rules:
-        for g_key, g_val in (rule.get("groups") or {}).items():
-            for item in g_val.get("strings", []):
-                item.pop("enc_tokens", None)
+        if s_inner_idx is None or s_inner_idx < 0:
+            container = outer_list[s_outer_idx]
+        else:
+            # creamOS SIEMPRE el array "strings" para albergar hijos normalizados
+            container = outer_list[s_outer_idx]
+            inner_list = container.setdefault("strings", [])
+            while len(inner_list) <= s_inner_idx:
+                inner_list.append({})
+            container = inner_list[s_inner_idx]
 
+        sess_list = container.setdefault("session_tokens", [])
+        while len(sess_list) <= pos_idx:
+            sess_list.append(None)
+        # si necesitas alternativas, cambia a lista y haz append
+        sess_list[pos_idx] = {"sj": sj_hex}
+
+    # 2) Limpieza recursiva: borra enc_tokens y wrappers vacíos
+    def _strip_enc_tokens_deep(obj):
+        if isinstance(obj, dict):
+            obj.pop("enc_tokens", None)
+            for k in list(obj.keys()):
+                v = obj[k]
+                _strip_enc_tokens_deep(v)
+                if isinstance(v, list):
+                    # filtra {} de las listas
+                    v2 = [x for x in v if not (isinstance(x, dict) and len(x) == 0)]
+                    if v2:
+                        obj[k] = v2
+                    else:
+                        obj.pop(k, None)
+        elif isinstance(obj, list):
+            for i in range(len(obj)):
+                _strip_enc_tokens_deep(obj[i])
+
+    _strip_enc_tokens_deep(out)
     return out
+
 
 
 
@@ -234,46 +225,79 @@ def pretty_print_ruleset(ruleset: Dict[str, Any]) -> str:
 # Runtime matching helpers
 # =========================
 
-def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int]]]:
-    flat_tokens = []
-    rev_map: Dict[int, Tuple[int, str, int, int]] = {}
+def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int, int]]]:
+    """
+    Aplana tokens contemplando:
+      - enc_tokens DIRECTO en el string externo  -> s_inner_idx = -1
+      - enc_tokens dentro de wrappers bajo cualquier clave LISTA (excepto 'id')
+        => esos wrappers se ven como strings "hijos" -> s_inner_idx = 0,1,2,...
+
+    Devuelve:
+      flat_tokens = [{seq, obfuscated, signature}, ...]
+      rev_map[seq] = (r_idx, g_key, s_outer_idx, s_inner_idx, pos_idx)
+    """
+    flat_tokens: List[Dict[str, Any]] = []
+    rev_map: Dict[int, Tuple[int, str, int, int, int]] = {}
     seq = 0
 
-    # 👇 Usa una normalización si ya la tienes; si no, rules = ruleset.get("rules", [])
     rules = (ruleset or {}).get("rules", [])
 
     for r_idx, rule in enumerate(rules):
         for g_key, g_val in (rule.get("groups") or {}).items():
-            for s_idx, s_item in enumerate(g_val.get("strings", [])):
-                enc_list = s_item.get("enc_tokens")
-                if not enc_list:
-                    continue
+            outer_list = g_val.get("strings", []) or []
+            for s_outer_idx, outer in enumerate(outer_list):
+                # --- Caso A: enc_tokens directo en el item externo
+                if isinstance(outer, dict) and isinstance(outer.get("enc_tokens"), list):
+                    enc_list = outer["enc_tokens"]
+                    for pos_idx, entry in enumerate(enc_list):
+                        if isinstance(entry, dict):
+                            ri, sig = entry.get("ri"), entry.get("sig")
+                            if ri and sig:
+                                flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                                rev_map[seq] = (r_idx, g_key, s_outer_idx, -1, pos_idx)
+                                seq += 1
+                        elif isinstance(entry, list):
+                            # alternativas: comparten pos_idx
+                            for alt in entry:
+                                if isinstance(alt, dict):
+                                    ri, sig = alt.get("ri"), alt.get("sig")
+                                    if ri and sig:
+                                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                                        rev_map[seq] = (r_idx, g_key, s_outer_idx, -1, pos_idx)
+                                        seq += 1
 
-                for e_idx, entry in enumerate(enc_list):
-                    # Puede venir dict (una sola opción) o lista (varias alternativas para el MISMO pos)
-                    if isinstance(entry, dict):
-                        ri, sig = entry.get("ri"), entry.get("sig")
-                        if not ri or not sig: 
+                # --- Caso B: wrappers en cualquier lista (p.ej. "value", "segments"...)
+                inner_wrappers = []
+                if isinstance(outer, dict):
+                    for k, v in outer.items():
+                        if k == "id":
                             continue
-                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
-                        # rev_map NO cambia: mapea a (pos=e_idx)
-                        rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
-                        seq += 1
+                        if isinstance(v, list):
+                            for w in v:
+                                if isinstance(w, dict) and isinstance(w.get("enc_tokens"), list):
+                                    inner_wrappers.append(w)
 
-                    elif isinstance(entry, list):
-                        # Alternativas para el mismo e_idx
-                        for alt in entry:
-                            if not isinstance(alt, dict):
-                                continue
-                            ri, sig = alt.get("ri"), alt.get("sig")
-                            if not ri or not sig:
-                                continue
-                            flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
-                            # Todas las alternativas comparten el MISMO e_idx (posición)
-                            rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
-                            seq += 1
+                for s_inner_idx, inner in enumerate(inner_wrappers):
+                    enc_list = inner.get("enc_tokens") or []
+                    for pos_idx, entry in enumerate(enc_list):
+                        if isinstance(entry, dict):
+                            ri, sig = entry.get("ri"), entry.get("sig")
+                            if ri and sig:
+                                flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                                rev_map[seq] = (r_idx, g_key, s_outer_idx, s_inner_idx, pos_idx)
+                                seq += 1
+                        elif isinstance(entry, list):
+                            for alt in entry:
+                                if isinstance(alt, dict):
+                                    ri, sig = alt.get("ri"), alt.get("sig")
+                                    if ri and sig:
+                                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                                        rev_map[seq] = (r_idx, g_key, s_outer_idx, s_inner_idx, pos_idx)
+                                        seq += 1
 
     return flat_tokens, rev_map
+
+
 
 
 def reset_runtime_state(runtime):
@@ -430,45 +454,35 @@ def _extract_enc_positions_from_string_item(s_item):
 
 
 def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool, dict | None]:
-    if not isinstance(node, dict):
-        return False, None
-
-    if "or" in node:
-        for sub in node.get("or", []):
-            ok, m = _eval_condition_node(sub, g_truth, r_entry)
-            if ok:
-                return True, (m if m is not None else sub)
-        return False, None
-
-    if "and" in node:
-        ok_all, last_true = True, None
-        for sub in node.get("and", []):
-            ok, m = _eval_condition_node(sub, g_truth, r_entry)
-            if not ok:
-                ok_all = False
-            else:
-                last_true = m if m is not None else sub
-        return ok_all, (last_true if ok_all else None)
-
-    # NUEVO: sequence (usa satisfied del edge)
+    ...
     if "sequence" in node and isinstance(node["sequence"], dict):
         s = node["sequence"]
         gid = str(s.get("group",""))
-        fid = str(s.get("from",""))
-        tid = str(s.get("to",""))
+        fid = str(s.get("from","")); tid = str(s.get("to",""))
         lo, hi = _parse_sequence_op(s.get("op",""))
+
+        # convertir BYTES -> TOKENS (coherente con build_runtime_index)
+        lo *= BLOCK_BYTES
+        hi *= BLOCK_BYTES
+
         for e in r_entry.get("seq_edges", []):
             if e["group"] == gid and e["from_id"] == fid and e["to_id"] == tid and e["lo"] == lo and e["hi"] == hi:
-                return (bool(e.get("satisfied")), node if e.get("satisfied") else None)
-        return (False, None)
+                sat = bool(e.get("satisfied"))
+                return sat, (node if sat else None)
+        return False, None
 
-    # Base: groups
-    op = (node.get("operator") or "and").lower()
-    groups = node.get("groups", [])
-    vals = [g_truth.get(k, False) for k in groups]
-    ok = (all(vals) if op == "and" else any(vals) if op == "or" else (not any(vals) if op == "not" else False))
-    return ok, node
-
+def _rule_sequences_ok(r_entry, needed_groups: set | None = None) -> bool:
+    """
+    Devuelve True sólo si TODAS las edges de sequence relevantes están satisfechas.
+    Si needed_groups es None -> chequea todas las edges de la regla.
+    Si se pasa un set -> sólo chequea edges cuyo 'group' ∈ needed_groups.
+    """
+    for e in r_entry.get("seq_edges", []):
+        if needed_groups and e.get("group") not in needed_groups:
+            continue
+        if not e.get("satisfied"):
+            return False
+    return True
 
 
 
@@ -546,8 +560,10 @@ def process_encrypted_tokens_with_conditions(prf,
                             break
 
                 if not allow_start:
-                    continue  # ignoramos el intento de arranque fuera de ventana
-
+                    print(f"[SEQ] Deny start {g_key}[s{s_idx}] at i={i}: " f"no pending window")
+                    continue
+                print(f"[SEQ] Allow start {g_key}[s{s_idx}] at i={i}: "
+                    f"edge={chosen_edge} window=[{p['ready_i']},{p['deadline_i']}]")
                 _update_string_run_state(s_state, token_pos=0, traffic_i=i)
                 if chosen_edge is not None and s_state["run_len"] == 1:
                     s_state["bound_edge"] = chosen_edge
@@ -594,78 +610,119 @@ def process_encrypted_tokens_with_conditions(prf,
 
 
 def _group_truth_map(rule_entry):
-    """Builds {group_key: bool} from current per-string 'done' and group match_type."""
+    """
+    Devuelve {group_key: bool}. Para 'cadena', exige >=1 string done por cada seg_id
+    que participa en la cadena (según seq_edges). Para otros modos, respeta 'any/all/K'.
+    """
     out = {}
     for g_key, g in (rule_entry.get("groups") or {}).items():
         strs = g.get("strings", [])
+        mt = _coerce_match_type(g.get("match_type", "any"))
+
+        # ---- Modo especial 'cadena' ----
+        if isinstance(mt, str) and mt == "cadena":
+            # Segmentos que participan en la cadena (from/to en edges de este grupo)
+            segs_in_chain = set()
+            for e in rule_entry.get("seq_edges", []):
+                if e.get("group") == g_key:
+                    if e.get("from_id"): segs_in_chain.add(e["from_id"])
+                    if e.get("to_id"):   segs_in_chain.add(e["to_id"])
+
+            if not segs_in_chain:
+                # Si no hay edges, caer a 'any' (o False). Elegimos 'any' para no bloquear.
+                out[g_key] = any(s.get("done") for s in strs)
+                continue
+
+            # ¿Hay >=1 string done por cada segmento?
+            done_by_seg = {seg: False for seg in segs_in_chain}
+            for idx, s in enumerate(strs):
+                if not s.get("done"):
+                    continue
+                seg_id = s.get("seg_id")
+                if seg_id in done_by_seg:
+                    done_by_seg[seg_id] = True
+
+            out[g_key] = all(done_by_seg.values())
+            continue
+
+        # ---- Modos normales ----
         if not strs:
             out[g_key] = False
             continue
-        mt = _coerce_match_type(g.get("match_type", "any"))
         done_flags = [s.get("done") for s in strs]
         done_count = sum(1 for s in strs if s.get("done"))
 
         if isinstance(mt, int):
             out[g_key] = (done_count >= mt)
         elif isinstance(mt, str) and mt == "all":
-            out[g_key] = all(done_flags)
+            out[g_key] = all(done_flags) and len(strs) > 0
         else:
             out[g_key] = any(done_flags)
+
     return out
+
 
 def _eval_groups_and_conditions(runtime) -> bool:
     if not runtime:
         return False
     for r in runtime.get("rules", []):
-        # map por grupos
-        g_truth = {}
-        for g_key, g in r.get("groups", {}).items():
-            strs = g.get("strings", [])
-            k = g.get("threshold", 1)
-            done_count = sum(1 for s in strs if s.get("done"))
-            g_truth[g_key] = (done_count >= k)
+        # 1) gate por sequence: TODAS deben estar satisfechas
+        if not _rule_sequences_ok(r):    # <-- hard gate
+            continue
 
+        # 2) grupos (como ya tenías)
+        g_truth = _group_truth_map(r)
         conds = r.get("conditions", [])
         if not conds:
             if g_truth and all(g_truth.values()):
                 return True
             continue
 
-        for cond in conds:
-            ok, _ = _eval_condition_node(cond, g_truth, r)  # <-- pasa r
-            if ok:
-                return True
+        # 3) respeta OR/AND del JSON (no lo fuerces a AND implícito)
+        #    Evalúa el árbol tal cual está
+        ok, _ = _eval_condition_node(conds[0] if len(conds) == 1 else {"and": conds}, g_truth, r)
+        if ok:
+            return True
     return False
+
 
 def _eval_groups_and_conditions_with_details(runtime):
     if not runtime:
         return False, None
     for r_idx, r in enumerate(runtime.get("rules", [])):
+        # 1) gate por sequence
+        if not _rule_sequences_ok(r):
+            continue
+
+        # 2) grupos
         g_truth = _group_truth_map(r)
         conds = r.get("conditions", [])
         if not conds:
             if g_truth and all(g_truth.values()):
                 return True, {"rule_idx": r_idx, "clause_idx": None, "g_truth": g_truth, "cond": None}
             continue
-        for c_idx, cond in enumerate(conds):
-            ok, matched = _eval_condition_node(cond, g_truth, r)  # <-- pasa r
-            if ok:
-                return True, {
-                    "rule_idx": r_idx,
-                    "clause_idx": c_idx,
-                    "g_truth": g_truth,
-                    "cond": matched
-                }
+
+        root = conds[0] if len(conds) == 1 else {"and": conds}
+        ok, matched = _eval_condition_node(root, g_truth, r)
+        if ok:
+            return True, {
+                "rule_idx": r_idx,
+                "clause_idx": None,
+                "g_truth": g_truth,
+                "cond": matched
+            }
     return False, None
+
+
 
 
 
 # --- Match-type normalization ----------------------------------------------
 def _coerce_match_type(mt):
     """
-    Accept ints, 'all', 'any', or numeric strings like '14'.
-    Return an int for digits, or a lowercase string for others.
-    Fallback to 'any' if mt is None/unknown.
+    Acepta ints, 'all', 'any' o 'cadena' (y strings numéricas).
+    Devuelve el mismo string en minúsculas para 'all'/'any'/'cadena',
+    o el entero para dígitos. Fallback: 'any'.
     """
     if isinstance(mt, int):
         return mt
@@ -673,8 +730,8 @@ def _coerce_match_type(mt):
         s = mt.strip().lower()
         if s.isdigit():
             return int(s)
-        if s == "cadena":
-            return "all"
+        if s in ("all", "any", "cadena"):
+            return s
         return s
     return "any"
 
@@ -711,10 +768,6 @@ def _normalize_match_type(mt_raw, total_strings: int) -> tuple[str, int]:
 
 
 def snapshot_rule_status(runtime):
-    """
-    Snapshot por regla y por grupo:
-      match_type, total_strings, done_count, done_indices, is_true (estado del grupo).
-    """
     snap = []
     for r_idx, r in enumerate(runtime.get("rules", [])):
         gstat = {}
@@ -728,6 +781,23 @@ def snapshot_rule_status(runtime):
                 is_true = (done_count >= mt)
             elif isinstance(mt, str) and mt == "all":
                 is_true = (done_count == len(strs) and len(strs) > 0)
+            elif isinstance(mt, str) and mt == "cadena":
+                # segmentos que participan en la cadena (from/to del mismo grupo)
+                segs_in_chain = set()
+                for e in r.get("seq_edges", []):
+                    if e.get("group") == g_key:
+                        if e.get("from_id"): segs_in_chain.add(e["from_id"])
+                        if e.get("to_id"):   segs_in_chain.add(e["to_id"])
+                if not segs_in_chain:
+                    is_true = (done_count > 0)  # fallback amistoso
+                else:
+                    seg_index = g.get("seg_index", {})
+                    def seg_done(seg_id):
+                        for s_idx in seg_index.get(seg_id, []):
+                            if s_idx < len(strs) and strs[s_idx].get("done"):
+                                return True
+                        return False
+                    is_true = all(seg_done(seg) for seg in segs_in_chain)
             else:
                 is_true = (done_count > 0)
 
@@ -740,6 +810,7 @@ def snapshot_rule_status(runtime):
             }
         snap.append({"rule_idx": r_idx, "groups": gstat, "conditions": r.get("conditions", [])})
     return snap
+
 #--------------------------------------
 
 # --- helpers mínimas para sequences (si ya las tienes definidas, omite estas) ---
@@ -785,51 +856,150 @@ def _gather_sequence_edges(conditions: List[dict]) -> List[dict]:
 def build_runtime_index(final_ruleset: Dict[str, Any]):
     runtime = {"rules": []}
     sj_to_targets: Dict[str, List[Tuple[int, str, int, int]]] = {}
-    rules = (final_ruleset or {}).get("rules", [])
 
+    rules = (final_ruleset or {}).get("rules", [])
     for r_idx, rule in enumerate(rules):
-        r_entry = {"groups": {}, "conditions": rule.get("conditions", []),
-                   "seq_edges": [], "seq_by_to": {}, "seq_by_from": {}}
+        r_entry = {
+            "groups": {},
+            "conditions": rule.get("conditions", []),
+            "seq_edges": [],
+            "seq_by_to": {},     # { g_key: { s_idx: [edge_idx,...] } }
+            "seq_by_from": {}    # { g_key: { s_idx: [edge_idx,...] } }
+        }
 
         for g_key, g_val in (rule.get("groups") or {}).items():
             mt_norm = _coerce_match_type(g_val.get("match_type", "any"))
-            g_entry = {"match_type": mt_norm, "threshold": None, "strings": [], "seg_index": {}}
+
+            g_entry = {
+                "match_type": mt_norm,
+                "threshold": None,
+                "strings": [],
+                "seg_index": {}     # { seg_id: [s_idx, ...] }  <-- lista (¡no uno solo!)
+            }
 
             for s_idx, s_item in enumerate(g_val.get("strings", [])):
-                seg_id = s_item.get("id")
-                sess_list = s_item.get("session_tokens", [])
-                sj_list = []  # placeholder por POS
+                parent_seg_id = s_item.get("id")
 
+                # Caso con hijas: { "id": "g1_segX", "strings": [ {...}, {...} ] }
+                child_strings = s_item.get("strings")
+                if isinstance(child_strings, list) and child_strings:
+                    for child in child_strings:
+                        sess_list = child.get("session_tokens", [])
+                        pos_count = len(sess_list)
+
+                        # indexa TODAS las alternativas (por posición)
+                        for pos, token in enumerate(sess_list):
+                            if not token:
+                                continue
+                            alts = token if isinstance(token, list) else [token]
+                            for alt in alts:
+                                sj_hex = (alt.get("sj") or "").strip()
+                                if not sj_hex:
+                                    continue
+                                sj_to_targets.setdefault(sj_hex.lower(), []).append(
+                                    (r_idx, g_key, len(g_entry["strings"]), pos)
+                                )
+
+                        # placeholder runtime por string hijo
+                        sj_placeholder = [None] * pos_count
+                        byte_len = max(8, pos_count + 7)
+                        new_s_idx = len(g_entry["strings"])
+
+                        g_entry["strings"].append({
+                            "seg_id": parent_seg_id,
+                            "sj_list": sj_placeholder,
+                            "pos_count": pos_count,
+                            "need_consecutive": True,
+                            "byte_len": byte_len,
+                            "run_len": 0,
+                            "last_hit_i": None,
+                            "cur_start_i": None,
+                            "bound_edge": None,
+                            "just_done_at": None,
+                            "done": False
+                        })
+
+                        if parent_seg_id:
+                            g_entry["seg_index"].setdefault(parent_seg_id, []).append(new_s_idx)
+                    continue
+
+                # Caso directo: session_tokens en el propio item
+                sess_list = s_item.get("session_tokens", [])
+                pos_count = len(sess_list)
                 for pos, token in enumerate(sess_list):
                     if not token:
                         continue
                     alts = token if isinstance(token, list) else [token]
-                    any_added = False
                     for alt in alts:
                         sj_hex = (alt.get("sj") or "").strip()
                         if not sj_hex:
                             continue
-                        any_added = True
-                        sj_to_targets.setdefault(sj_hex.lower(), []).append((r_idx, g_key, s_idx, pos))
-                    if any_added:
-                        sj_list.append(None)  # 1 pos, aunque haya N alternativas
+                        sj_to_targets.setdefault(sj_hex.lower(), []).append(
+                            (r_idx, g_key, len(g_entry["strings"]), pos)
+                        )
 
-                byte_len = max(8, len(sj_list) + 7)
+                sj_placeholder = [None] * pos_count
+                byte_len = max(8, pos_count + 7)
+                new_s_idx = len(g_entry["strings"])
+
                 g_entry["strings"].append({
-                    "seg_id": seg_id, "sj_list": sj_list, "byte_len": byte_len,
-                    "need_consecutive": True, "run_len": 0, "last_hit_i": None,
-                    "cur_start_i": None, "bound_edge": None, "just_done_at": None, "done": False
+                    "seg_id": parent_seg_id,
+                    "sj_list": sj_placeholder,
+                    "pos_count": pos_count,
+                    "need_consecutive": True,
+                    "byte_len": byte_len,
+                    "run_len": 0,
+                    "last_hit_i": None,
+                    "cur_start_i": None,
+                    "bound_edge": None,
+                    "just_done_at": None,
+                    "done": False
                 })
-                if seg_id:
-                    g_entry["seg_index"][seg_id] = s_idx
 
+                if parent_seg_id:
+                    g_entry["seg_index"].setdefault(parent_seg_id, []).append(new_s_idx)
+
+            # Para no-cadena seguimos con umbral estándar
             _mode, k = _normalize_match_type(mt_norm, len(g_entry["strings"]))
             g_entry["threshold"] = k
             r_entry["groups"][g_key] = g_entry
 
-        # (tu resolución de sequences aquí, igual que ya tienes)
+        # === Engancha edges de sequence para este rule ===
+        edges = _gather_sequence_edges(r_entry["conditions"])
+        for e in edges:
+            # e["lo"], e["hi"] vienen en BYTES -> conviértelo a TOKENS
+            lo_tokens = e["lo"] * BLOCK_BYTES
+            hi_tokens = e["hi"] * BLOCK_BYTES
+
+            edge_idx = len(r_entry["seq_edges"])
+            r_entry["seq_edges"].append({
+                "group":   e["group"],
+                "from_id": e["from_id"],
+                "to_id":   e["to_id"],
+                "lo":      lo_tokens,   # <-- ahora en TOKENS
+                "hi":      hi_tokens,   # <-- ahora en TOKENS
+                "pending": None,
+                "satisfied": False
+            })
+
+            gk = e["group"]
+            # mapear FROM
+            from_list = r_entry["groups"].get(gk, {}).get("seg_index", {}).get(e["from_id"], [])
+            if from_list:
+                by_from = r_entry["seq_by_from"].setdefault(gk, {})
+                for s_idx in from_list:
+                    by_from.setdefault(s_idx, []).append(edge_idx)
+            # mapear TO
+            to_list = r_entry["groups"].get(gk, {}).get("seg_index", {}).get(e["to_id"], [])
+            if to_list:
+                by_to = r_entry["seq_by_to"].setdefault(gk, {})
+                for s_idx in to_list:
+                    by_to.setdefault(s_idx, []).append(edge_idx)
+
         runtime["rules"].append(r_entry)
 
     return runtime, sj_to_targets
+
+
 
 
