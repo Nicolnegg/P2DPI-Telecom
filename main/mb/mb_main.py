@@ -282,7 +282,7 @@ def _try_finalize_batch(batch_id: str):
                         len(any_addr), any_addr, len(revmap))
     except StopIteration:
         app.logger.debug("[MB] rev_map empty at finalize")
-        
+
     final_ruleset = rebuild_session_ruleset(ruleset_in, revmap, seq_to_sj)
 
      # --- DEBUG: resumen de session_tokens por string ---
@@ -309,8 +309,8 @@ def _try_finalize_batch(batch_id: str):
     reset_runtime_state(RUNTIME)
 
     app.logger.info(f"[MB] ✅ Finalized batch {batch_id}. session tokens: {len(SESSION_RULES)}")
-    app.logger.debug("\n[MB] ===== FINAL RULESET (SESSION) =====\n%s\n[MB] ===== END =====\n",
-                     pretty_print_ruleset(RULESET_SESSION))
+#    app.logger.debug("\n[MB] ===== FINAL RULESET (SESSION) =====\n%s\n[MB] ===== END =====\n",
+#                     pretty_print_ruleset(RULESET_SESSION))
 
     del BATCHES[batch_id]
     return jsonify({"status": "finalized", "session_rules_count": len(SESSION_RULES)}), 200

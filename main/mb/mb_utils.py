@@ -19,6 +19,14 @@ from typing import Dict, Tuple, List, Any
 # Tamaño del bloque con el que viaja el tráfico (en bytes)
 BLOCK_BYTES = int(os.environ.get("MB_BLOCK_BYTES", "8"))
 
+# --- DEBUG helpers ---
+DEBUG = bool(int(os.environ.get("MB_DEBUG", "1")))  # pon 0 para silenciar
+
+def debug(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+# ----------------------
+
 # -------------------------
 # PRF loader and signatures
 # -------------------------
@@ -461,14 +469,20 @@ def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool
         fid = str(s.get("from","")); tid = str(s.get("to",""))
         lo, hi = _parse_sequence_op(s.get("op",""))
 
-        # convertir BYTES -> TOKENS (coherente con build_runtime_index)
-        lo *= BLOCK_BYTES
-        hi *= BLOCK_BYTES
+        # JSON viene en BYTES → conviértelo a TOKENS para alinear con build_runtime_index
+        BASE = BLOCK_BYTES - 1
+        lo = BASE + lo
+        hi = BASE + hi
 
         for e in r_entry.get("seq_edges", []):
-            if e["group"] == gid and e["from_id"] == fid and e["to_id"] == tid and e["lo"] == lo and e["hi"] == hi:
+            if (e["group"] == gid and e["from_id"] == fid and e["to_id"] == tid
+                and e["lo"] == lo and e["hi"] == hi):
                 sat = bool(e.get("satisfied"))
+                #DEBUG
+                debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] satisfied={sat}")
                 return sat, (node if sat else None)
+        debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] edge not found in runtime")
+
         return False, None
 
 def _rule_sequences_ok(r_entry, needed_groups: set | None = None) -> bool:
@@ -486,22 +500,34 @@ def _rule_sequences_ok(r_entry, needed_groups: set | None = None) -> bool:
 
 
 
-def process_encrypted_tokens_with_conditions(prf,
-                                             tokens: List[str],
-                                             counter: int,
-                                             runtime,
-                                             sj_to_targets: Dict[str, list],
-                                             h2_func) -> tuple[bool, dict | None]:
+def process_encrypted_tokens_with_conditions(
+    prf,
+    tokens: List[str],
+    counter: int,
+    runtime,
+    sj_to_targets: Dict[str, list],
+    h2_func
+) -> tuple[bool, dict | None]:
     """
     Escanea Ti vs todos los Sj, con gating de 'sequence':
       - Un 'to' sólo puede arrancar (pos 0) si existe un edge pendiente con ready_i<=i<=deadline_i.
       - Cuando 'from' termina, se crea el pending con ventana [ready_i, deadline_i].
       - Cuando 'to' termina (y estaba ligado a ese edge), se marca satisfied=True.
+
+    Notas:
+      - Se asume que build_runtime_index ya convirtió lo/hi de BYTES -> TOKENS.
+      - Esta función usa 'debug' si existe en globals; si no, cae a 'print'.
     """
     if not runtime or not sj_to_targets:
         return False, None
 
+    # Usa 'debug' si está definido en tu proyecto; si no, usa print
+    dbg = globals().get("debug", print)
+
     for i, Ti in enumerate(tokens):
+        if i == 0:
+            dbg(f"[SCAN] tokens={len(tokens)} counter={counter} BLOCK_BYTES={BLOCK_BYTES}")
+
         ti_low = (Ti or "").lower()
         if not ti_low:
             continue
@@ -510,13 +536,24 @@ def process_encrypted_tokens_with_conditions(prf,
         for r_entry in runtime.get("rules", []):
             for e_idx, e in enumerate(r_entry.get("seq_edges", [])):
                 p = e.get("pending")
-                if p and (i > p["deadline_i"]) and (not e.get("satisfied")):
+                if not p or e.get("satisfied"):
+                    continue
+
+                # Si el 'to' ya arrancó y sigue sin terminar, NO expirar el pending.
+                to_in_progress = any(
+                    s.get("bound_edge") == e_idx and not s.get("done")
+                    for g in r_entry.get("groups", {}).values()
+                    for s in g.get("strings", [])
+                )
+
+                if (i > p["deadline_i"]) and (not to_in_progress):
+                    dbg(
+                        f"[SEQ] expire pending edge at i={i}: "
+                        f"window=[{p['ready_i']},{p['deadline_i']}] "
+                        f"({e['from_id']}->{e['to_id']} lo={e['lo']} hi={e['hi']})"
+                    )
                     e["pending"] = None
-                    # liberar vínculos obsoletos de 'to' ligados a este edge
-                    for g in r_entry.get("groups", {}).values():
-                        for s in g.get("strings", []):
-                            if s.get("bound_edge") == e_idx and not s.get("done"):
-                                s["bound_edge"] = None
+                    # (ya no se limpia bound_edge aquí; sólo expiramos si NO había 'to' en progreso)
 
         # ---- Fase A: recolectar hits por string en este i ----
         per_string_hits: Dict[tuple, set] = {}
@@ -536,15 +573,10 @@ def process_encrypted_tokens_with_conditions(prf,
 
             expected = s_state.get("run_len", 0)
 
-            # 1) preferimos el siguiente esperado
-            if expected in poses:
-                _update_string_run_state(s_state, token_pos=expected, traffic_i=i)
-                continue
-
-            # 2) si hay pos0, sólo permitimos arrancar si pasa el gating por sequence
-            if 0 in poses:
+            # 1) CASO INICIO: expected==0 y hay pos 0 -> SIEMPRE pasa por el gating de sequence
+            if expected == 0 and 0 in poses:
                 r_entry = runtime["rules"][r_idx]
-                by_to = r_entry.get("seq_by_to", {}).get(g_key, {})
+                by_to    = r_entry.get("seq_by_to", {}).get(g_key, {})
                 to_edges = by_to.get(s_idx, [])
 
                 allow_start = True
@@ -560,17 +592,30 @@ def process_encrypted_tokens_with_conditions(prf,
                             break
 
                 if not allow_start:
-                    print(f"[SEQ] Deny start {g_key}[s{s_idx}] at i={i}: " f"no pending window")
+                    dbg(f"[SEQ] deny start {g_key}[s{s_idx}] at i={i}: no pending window")
                     continue
-                print(f"[SEQ] Allow start {g_key}[s{s_idx}] at i={i}: "
-                    f"edge={chosen_edge} window=[{p['ready_i']},{p['deadline_i']}]")
+
+                if chosen_edge is None:
+                    # No hay edge 'to' mapeado: no hay gating real, se permite arrancar
+                    dbg(f"[SEQ] allow start {g_key}[s{s_idx}] at i={i}: no-edge gating")
+                else:
+                    p = r_entry["seq_edges"][chosen_edge].get("pending") or {}
+                    dbg(
+                        f"[SEQ] allow start {g_key}[s{s_idx}] at i={i}: "
+                        f"edge={chosen_edge} window=[{p.get('ready_i')},{p.get('deadline_i')}]"
+                    )
+
                 _update_string_run_state(s_state, token_pos=0, traffic_i=i)
                 if chosen_edge is not None and s_state["run_len"] == 1:
                     s_state["bound_edge"] = chosen_edge
                 continue
 
-            # 3) ignorar otros _poses_ (evita autosabotaje por repeticiones)
-            # (no llamamos a _update_string_run_state)
+            # 2) CASO PROGRESO NORMAL: ya empezó (expected>0) y hay el siguiente esperado
+            if expected > 0 and expected in poses:
+                _update_string_run_state(s_state, token_pos=expected, traffic_i=i)
+                continue
+
+            # 3) Otros casos: ignorar para no autosabotear (repeticiones/out-of-order)
 
         # ---- Fase C: disparadores por strings que ACABAN justo en este i ----
         # a) Cuando 'from' termina, activar pending(ready_i, deadline_i)
@@ -584,15 +629,37 @@ def process_encrypted_tokens_with_conditions(prf,
                         for edge_idx in by_from.get(s_idx2, []):
                             e = r_entry["seq_edges"][edge_idx]
                             # 'i' es el índice del ÚLTIMO token de 'from' (terminó justo en i)
-                            ready = i + 1 + e["lo"]
+                            ready = i + 1 + e["lo"]     # lo/hi ya están en TOKENS
                             deadl = i + 1 + e["hi"]
-                            e["pending"] = {"ready_i": ready, "deadline_i": deadl}
+                            e["pending"] = {
+                                "ready_i": ready,
+                                "deadline_i": deadl,
+                                "from_end_i": i,   # <- para poder loguear gap con 'to'
+                            }
+                            dbg(
+                                f"[SEQ] FROM done g={g_key2} s={s_idx2} at i={i} -> "
+                                f"pending [{ready},{deadl}] (lo={e['lo']} hi={e['hi']})"
+                            )
 
                 # b) to -> satisfied
                 for s_idx2, s2 in enumerate(g2.get("strings", [])):
                     if s2.get("just_done_at") == i and s2.get("bound_edge") is not None:
                         edge_idx = s2["bound_edge"]
                         e = r_entry["seq_edges"][edge_idx]
+                        p = e.get("pending") or {}
+                        from_end = p.get("from_end_i")
+                        to_start = s2.get("cur_start_i")
+                        gap_tokens = (
+                            to_start - (from_end + 1)
+                            if (from_end is not None and to_start is not None)
+                            else None
+                        )
+                        dbg(
+                            f"[SEQ] TO done g={g_key2} s={s_idx2} at i={i} -> edge {edge_idx} "
+                            f"gap_tokens={gap_tokens} expected=[{e['lo']},{e['hi']}] "
+                            f"({e['from_id']}->{e['to_id']})"
+                        )
+
                         e["satisfied"] = True
                         e["pending"] = None
                         s2["bound_edge"] = None
@@ -607,6 +674,7 @@ def process_encrypted_tokens_with_conditions(prf,
 
     # Nada disparó
     return False, {"snapshot": snapshot_rule_status(runtime)}
+
 
 
 def _group_truth_map(rule_entry):
@@ -692,6 +760,10 @@ def _eval_groups_and_conditions_with_details(runtime):
     for r_idx, r in enumerate(runtime.get("rules", [])):
         # 1) gate por sequence
         if not _rule_sequences_ok(r):
+            print(f"[EVAL] rule {r_idx} sequences NOT OK -> skip")
+            for idx, e in enumerate(r.get("seq_edges", [])):
+                print(f"   edge={idx} sat={e['satisfied']} pend={e['pending']} "
+                    f"({e['from_id']}->{e['to_id']} lo={e['lo']} hi={e['hi']})")
             continue
 
         # 2) grupos
@@ -704,7 +776,10 @@ def _eval_groups_and_conditions_with_details(runtime):
 
         root = conds[0] if len(conds) == 1 else {"and": conds}
         ok, matched = _eval_condition_node(root, g_truth, r)
+        debug(f"[EVAL] rule {r_idx} g_truth={g_truth} ok={ok} matched={matched}")
+
         if ok:
+
             return True, {
                 "rule_idx": r_idx,
                 "clause_idx": None,
@@ -967,9 +1042,16 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
         # === Engancha edges de sequence para este rule ===
         edges = _gather_sequence_edges(r_entry["conditions"])
         for e in edges:
-            # e["lo"], e["hi"] vienen en BYTES -> conviértelo a TOKENS
-            lo_tokens = e["lo"] * BLOCK_BYTES
-            hi_tokens = e["hi"] * BLOCK_BYTES
+            # e["lo"], e["hi"] vienen en BYTES -> conviértelo a TOKENS con BASE=BLOCK_BYTES-1
+            BASE = BLOCK_BYTES - 1
+            lo_tokens = BASE + e["lo"]
+            hi_tokens = BASE + e["hi"]
+
+            # DEBUG: ver traducción de rangos
+            debug("[IDX][EDGE]",
+                  f"group={e['group']} from={e['from_id']} to={e['to_id']} ",
+                  f"lo_bytes={e['lo']} hi_bytes={e['hi']} -> lo_tokens={lo_tokens} hi_tokens={hi_tokens}",
+                  f"(BLOCK_BYTES={BLOCK_BYTES}, BASE={BASE})")
 
             edge_idx = len(r_entry["seq_edges"])
             r_entry["seq_edges"].append({
@@ -981,6 +1063,11 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
                 "pending": None,
                 "satisfied": False
             })
+
+            print("[IDX][EDGE] "
+                f"group={e['group']} from={e['from_id']} to={e['to_id']} "
+                f"lo_bytes={e['lo']} hi_bytes={e['hi']} "
+                f"-> lo_tokens={lo_tokens} hi_tokens={hi_tokens}")
 
             gk = e["group"]
             # mapear FROM
