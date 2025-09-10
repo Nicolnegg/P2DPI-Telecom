@@ -748,7 +748,7 @@ def yara_to_default_dict(yara_path: str) -> dict:
 if __name__ == "__main__":
     # Adjust this path to your YARA file
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    yara_path = os.path.join(script_dir, "YARA", "Maldoc_VBA_macro_code.yar")
+    yara_path = os.path.join(script_dir, "YARA", "WShell_ChinaChopper.yar")
 
     out = yara_to_default_dict(yara_path)
 

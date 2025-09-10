@@ -143,54 +143,39 @@ def h2_compute(prf: CDLL, counter_i: int, session_key_hex: str) -> str:
 # -------------------------
 
 def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int]]]:
-    """
-    Aplana tokens soportando:
-      - enc_tokens con N alternativas (1 posición)
-      - varias posiciones como lista de wrappers con enc_tokens
-      - modo split_positions (cada {ri,sig} = 1 posición)
-    Para CADA POSICIÓN e_idx se añaden N filas (una por alternativa) con el MISMO e_idx.
-    """
     flat_tokens = []
     rev_map: Dict[int, Tuple[int, str, int, int]] = {}
     seq = 0
+    rules = (ruleset or {}).get("rules", [])
 
-    for r_idx, rule in enumerate((ruleset or {}).get("rules", [])):
+    for r_idx, rule in enumerate(rules):
         for g_key, g_val in (rule.get("groups") or {}).items():
-            for s_idx, s_item in enumerate((g_val.get("strings") or [])):
-                positions = _extract_enc_positions_from_string_item(s_item)
-                if not positions:
-                    # compat: forma antigua {"enc_tokens":[...]} directamente
-                    enc_list = s_item.get("enc_tokens") if isinstance(s_item, dict) else None
-                    if isinstance(enc_list, list):
-                        positions = [[t for t in enc_list if isinstance(t, dict)]]
-
-                for e_idx, alts in enumerate(positions):
-                    for alt in alts:
-                        ri = alt.get("ri"); sig = alt.get("sig")
-                        if not ri or not sig:
+            for s_idx, s_item in enumerate(g_val.get("strings", [])):
+                enc_list = s_item.get("enc_tokens")
+                if not enc_list:
+                    continue
+                for e_idx, entry in enumerate(enc_list):
+                    if isinstance(entry, dict):
+                        ri, sig = entry.get("ri"), entry.get("sig")
+                        if not ri or not sig: 
                             continue
                         flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
-                        # ¡OJO! TODAS las alternativas comparten el MISMO e_idx (posición)
                         rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
                         seq += 1
-
+                    elif isinstance(entry, list):
+                        # múltiples alternativas para el MISMO e_idx
+                        for alt in entry:
+                            if not isinstance(alt, dict): 
+                                continue
+                            ri, sig = alt.get("ri"), alt.get("sig")
+                            if not ri or not sig: 
+                                continue
+                            flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                            rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
+                            seq += 1
     return flat_tokens, rev_map
 
 
-
-def _strip_enc_tokens_deep(obj):
-    if isinstance(obj, dict):
-        obj.pop("enc_tokens", None)
-        for k in list(obj.keys()):
-            v = obj[k]
-            _strip_enc_tokens_deep(v)
-            if isinstance(v, list):
-                obj[k] = [x for x in v if not (isinstance(x, dict) and len(x) == 0)]
-                if not obj[k]:
-                    obj.pop(k, None)
-    elif isinstance(obj, list):
-        for x in obj:
-            _strip_enc_tokens_deep(x)
 
 def rebuild_session_ruleset(ruleset_in: Dict[str, Any],
                             rev_map: Dict[int, Tuple[int, str, int, int]],
@@ -198,29 +183,41 @@ def rebuild_session_ruleset(ruleset_in: Dict[str, Any],
     out = copy.deepcopy(ruleset_in)
     rules = out.get("rules", [])
 
-    # 1) agrupa por (r,g,s,posición) → lista de SJs (alternativas)
-    bucket: Dict[Tuple[int, str, int, int], List[str]] = {}
     for seq, sj_hex in seq_to_sj.items():
         r_idx, g_key, s_idx, e_idx = rev_map[seq]
-        bucket.setdefault((r_idx, g_key, s_idx, e_idx), []).append(sj_hex)
-
-    # 2) vuelca en session_tokens respetando POSICIONES y ALTERNATIVAS
-    for (r_idx, g_key, s_idx, e_idx), sjs in bucket.items():
         group = rules[r_idx]["groups"][g_key]
-        item  = group["strings"][s_idx]
+        strings = group.get("strings", [])
+        if s_idx >= len(strings):
+            continue
+        item = strings[s_idx]
         sess_list = item.setdefault("session_tokens", [])
         while len(sess_list) <= e_idx:
             sess_list.append(None)
 
-        if len(sjs) == 1:
-            sess_list[e_idx] = {"sj": sjs[0]}
+        new_tok = {"sj": sj_hex}
+        if sess_list[e_idx] is None:
+            sess_list[e_idx] = new_tok                               # primera alternativa
+        elif isinstance(sess_list[e_idx], dict):
+            sess_list[e_idx] = [sess_list[e_idx], new_tok]           # convertir a lista
+        elif isinstance(sess_list[e_idx], list):
+            sess_list[e_idx].append(new_tok)                         # agregar alternativa
         else:
-            sess_list[e_idx] = [{"sj": s} for s in sjs]
+            sess_list[e_idx] = [new_tok]
 
-    # 3) limpia cualquier rastro de enc_tokens
-    _strip_enc_tokens_deep(out)
+    # 🔴 Comprobación de faltantes (opcional pero recomendable)
+    expected = set(rev_map.values())
+    resolved = set(rev_map[seq] for seq in seq_to_sj.keys())
+    missing = expected - resolved
+    if missing:
+        raise RuntimeError(f"[MB] Faltan {len(missing)} session_tokens; ej: {list(missing)[:5]}")
+
+    # Elimina SIEMPRE enc_tokens del ruleset final
+    for rule in rules:
+        for g_key, g_val in (rule.get("groups") or {}).items():
+            for item in g_val.get("strings", []):
+                item.pop("enc_tokens", None)
+
     return out
-
 
 
 
@@ -236,6 +233,47 @@ def pretty_print_ruleset(ruleset: Dict[str, Any]) -> str:
 # =========================
 # Runtime matching helpers
 # =========================
+
+def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Tuple[int, str, int, int]]]:
+    flat_tokens = []
+    rev_map: Dict[int, Tuple[int, str, int, int]] = {}
+    seq = 0
+
+    # 👇 Usa una normalización si ya la tienes; si no, rules = ruleset.get("rules", [])
+    rules = (ruleset or {}).get("rules", [])
+
+    for r_idx, rule in enumerate(rules):
+        for g_key, g_val in (rule.get("groups") or {}).items():
+            for s_idx, s_item in enumerate(g_val.get("strings", [])):
+                enc_list = s_item.get("enc_tokens")
+                if not enc_list:
+                    continue
+
+                for e_idx, entry in enumerate(enc_list):
+                    # Puede venir dict (una sola opción) o lista (varias alternativas para el MISMO pos)
+                    if isinstance(entry, dict):
+                        ri, sig = entry.get("ri"), entry.get("sig")
+                        if not ri or not sig: 
+                            continue
+                        flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                        # rev_map NO cambia: mapea a (pos=e_idx)
+                        rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
+                        seq += 1
+
+                    elif isinstance(entry, list):
+                        # Alternativas para el mismo e_idx
+                        for alt in entry:
+                            if not isinstance(alt, dict):
+                                continue
+                            ri, sig = alt.get("ri"), alt.get("sig")
+                            if not ri or not sig:
+                                continue
+                            flat_tokens.append({"seq": seq, "obfuscated": ri, "signature": sig})
+                            # Todas las alternativas comparten el MISMO e_idx (posición)
+                            rev_map[seq] = (r_idx, g_key, s_idx, e_idx)
+                            seq += 1
+
+    return flat_tokens, rev_map
 
 
 def reset_runtime_state(runtime):
@@ -747,60 +785,40 @@ def _gather_sequence_edges(conditions: List[dict]) -> List[dict]:
 def build_runtime_index(final_ruleset: Dict[str, Any]):
     runtime = {"rules": []}
     sj_to_targets: Dict[str, List[Tuple[int, str, int, int]]] = {}
-
     rules = (final_ruleset or {}).get("rules", [])
+
     for r_idx, rule in enumerate(rules):
-        r_entry = {
-            "groups": {},
-            "conditions": rule.get("conditions", []),
-            "seq_edges": [],
-            "seq_by_to": {},
-            "seq_by_from": {}
-        }
+        r_entry = {"groups": {}, "conditions": rule.get("conditions", []),
+                   "seq_edges": [], "seq_by_to": {}, "seq_by_from": {}}
 
         for g_key, g_val in (rule.get("groups") or {}).items():
             mt_norm = _coerce_match_type(g_val.get("match_type", "any"))
-            g_entry = {
-                "match_type": mt_norm,
-                "threshold": None,
-                "strings": [],
-                "seg_index": {}
-            }
+            g_entry = {"match_type": mt_norm, "threshold": None, "strings": [], "seg_index": {}}
 
             for s_idx, s_item in enumerate(g_val.get("strings", [])):
                 seg_id = s_item.get("id")
                 sess_list = s_item.get("session_tokens", [])
+                sj_list = []  # placeholder por POS
 
-                # Longitud lógica: número de posiciones (no alternativas)
-                pos_count = len(sess_list)
-
-                # Indexa TODAS las alternativas por posición
                 for pos, token in enumerate(sess_list):
                     if not token:
                         continue
                     alts = token if isinstance(token, list) else [token]
+                    any_added = False
                     for alt in alts:
-                        sj_hex = (alt.get("sj") or "").strip() if isinstance(alt, dict) else ""
+                        sj_hex = (alt.get("sj") or "").strip()
                         if not sj_hex:
                             continue
+                        any_added = True
                         sj_to_targets.setdefault(sj_hex.lower(), []).append((r_idx, g_key, s_idx, pos))
+                    if any_added:
+                        sj_list.append(None)  # 1 pos, aunque haya N alternativas
 
-                # placeholder para compat (se usa pos_count realmente)
-                sj_placeholder = [None] * pos_count
-                byte_len = max(8, pos_count + 7)
-
+                byte_len = max(8, len(sj_list) + 7)
                 g_entry["strings"].append({
-                    "seg_id": seg_id,
-                    "sj_list": sj_placeholder,   # sólo marcador
-                    "pos_count": pos_count,      # ← usar esta
-                    "need_consecutive": True,
-                    "byte_len": byte_len,
-                    "run_len": 0,
-                    "last_hit_i": None,
-                    "cur_start_i": None,
-                    "bound_edge": None,
-                    "just_done_at": None,
-                    "done": False
+                    "seg_id": seg_id, "sj_list": sj_list, "byte_len": byte_len,
+                    "need_consecutive": True, "run_len": 0, "last_hit_i": None,
+                    "cur_start_i": None, "bound_edge": None, "just_done_at": None, "done": False
                 })
                 if seg_id:
                     g_entry["seg_index"][seg_id] = s_idx
@@ -809,10 +827,9 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
             g_entry["threshold"] = k
             r_entry["groups"][g_key] = g_entry
 
-        # (si ya tienes resolución de sequences, vuelve a engancharla aquí)
+        # (tu resolución de sequences aquí, igual que ya tienes)
         runtime["rules"].append(r_entry)
 
     return runtime, sj_to_targets
-
 
 

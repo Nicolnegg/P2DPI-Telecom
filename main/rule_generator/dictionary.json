@@ -1,65 +1,105 @@
 {
-  "Contains_VBA_macro_code": {
+  "webshell_ChinaChopper_aspx": {
     "groups": {
-      "officemagic": {
-        "match_type": "all",
+      "ChinaChopperASPX": {
+        "match_type": "cadena",
         "data_type": "hex",
         "strings": [
-          "D0 CF 11 E0 A1 B1 1A E1"
-        ]
-      },
-      "zipmagic": {
-        "match_type": "all",
-        "data_type": "string",
-        "strings": [
-          "PK"
-        ]
-      },
-      "97str": {
-        "match_type": "any",
-        "data_type": "mixed",
-        "strings": [
           {
-            "value": "_VBA_PROJECT_CUR",
-            "data_type": "string"
+            "id": "ChinaChopperASPX_s0",
+            "value": "25 40 20 50 61 67 65 20 4C 61 6E 67 75 61 67 65 3D"
           },
           {
-            "value": "VBAProject",
-            "data_type": "string"
+            "id": "ChinaChopperASPX_s1",
+            "value": "4A 73 63 72 69 70 74"
           },
           {
-            "value": "41 74 74 72 69 62 75 74 00 65 20 56 42 5F",
-            "data_type": "hex"
+            "id": "ChinaChopperASPX_s2",
+            "value": "25 3E 3C 25 65 76 61 6C 28 52 65 71 75 65 73 74 2E 49 74 65 6D 5B"
+          },
+          {
+            "id": "ChinaChopperASPX_s3",
+            "value": "75 6E 73 61 66 65"
           }
-        ]
-      },
-      "xmlstr": {
-        "match_type": "any",
-        "data_type": "string",
-        "strings": [
-          "vbaProject.bin",
-          "vbaData.xml"
         ]
       }
     },
     "conditions": [
       {
-        "or": [
+        "sequence": {
+          "group": "ChinaChopperASPX",
+          "from": "ChinaChopperASPX_s0",
+          "to": "ChinaChopperASPX_s1",
+          "op": "ONE_WILDCARD"
+        }
+      },
+      {
+        "sequence": {
+          "group": "ChinaChopperASPX",
+          "from": "ChinaChopperASPX_s1",
+          "to": "ChinaChopperASPX_s2",
+          "op": "ONE_WILDCARD"
+        }
+      },
+      {
+        "sequence": {
+          "group": "ChinaChopperASPX",
+          "from": "ChinaChopperASPX_s2",
+          "to": "ChinaChopperASPX_s3",
+          "op": "RANGE_1_100"
+        }
+      },
+      {
+        "groups": [
+          "ChinaChopperASPX"
+        ],
+        "operator": "and"
+      }
+    ]
+  },
+  "webshell_ChinaChopper_php": {
+    "groups": {
+      "ChinaChopperPHP": {
+        "match_type": "cadena",
+        "data_type": "hex",
+        "strings": [
           {
-            "groups": [
-              "officemagic",
-              "97str"
-            ],
-            "operator": "and"
+            "id": "ChinaChopperPHP_s0",
+            "value": "3C 3F 70 68 70 20 40 65 76 61 6C 28 24 5F 50 4F 53 54 5B"
           },
           {
-            "groups": [
-              "zipmagic",
-              "xmlstr"
-            ],
-            "operator": "and"
+            "id": "ChinaChopperPHP_s1",
+            "value": "70 61 73 73 77 6F 72 64"
+          },
+          {
+            "id": "ChinaChopperPHP_s2",
+            "value": "5D 29 3B 3F 3E"
           }
         ]
+      }
+    },
+    "conditions": [
+      {
+        "sequence": {
+          "group": "ChinaChopperPHP",
+          "from": "ChinaChopperPHP_s0",
+          "to": "ChinaChopperPHP_s1",
+          "op": "ONE_WILDCARD"
+        }
+      },
+      {
+        "sequence": {
+          "group": "ChinaChopperPHP",
+          "from": "ChinaChopperPHP_s1",
+          "to": "ChinaChopperPHP_s2",
+          "op": "ONE_WILDCARD"
+        }
+      },
+      {
+        "groups": [
+          "ChinaChopperPHP"
+        ],
+        "operator": "and"
       }
     ]
   }
