@@ -459,31 +459,71 @@ def _extract_enc_positions_from_string_item(s_item):
 
     return positions
 
-
-
 def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool, dict | None]:
-    ...
+    if not isinstance(node, dict):
+        return False, None
+
+    # --- SEQUENCE ---
     if "sequence" in node and isinstance(node["sequence"], dict):
         s = node["sequence"]
-        gid = str(s.get("group",""))
-        fid = str(s.get("from","")); tid = str(s.get("to",""))
-        lo, hi = _parse_sequence_op(s.get("op",""))
+        gid = str(s.get("group", ""))
+        fid = str(s.get("from", "")); tid = str(s.get("to", ""))
 
-        # JSON viene en BYTES → conviértelo a TOKENS para alinear con build_runtime_index
-        BASE = BLOCK_BYTES - 1
-        lo = BASE + lo
-        hi = BASE + hi
+        # 1) Candidatas por (group, from, to)
+        candidates = [e for e in r_entry.get("seq_edges", [])
+                      if e.get("group") == gid and e.get("from_id") == fid and e.get("to_id") == tid]
 
-        for e in r_entry.get("seq_edges", []):
-            if (e["group"] == gid and e["from_id"] == fid and e["to_id"] == tid
-                and e["lo"] == lo and e["hi"] == hi):
-                sat = bool(e.get("satisfied"))
-                #DEBUG
-                debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] satisfied={sat}")
-                return sat, (node if sat else None)
-        debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] edge not found in runtime")
+        if not candidates:
+            debug(f"[COND] sequence {fid}->{tid} no edge (group={gid}) in runtime")
+            return False, None
 
+        # 2) Si hay 'op' reconocido, filtramos por (lo,hi) EN TOKENS;
+        #    si no, usamos las candidatas tal cual.
+        lo = hi = None
+        op = s.get("op", "")
+        if isinstance(op, str):
+            lo_parsed, hi_parsed = _parse_sequence_op(op)  # devuelve números "abstractos"
+            if lo_parsed or hi_parsed:
+                # ¡OJO! seq_edges YA están en TOKENS; aquí NO volvemos a multiplicar.
+                lo, hi = lo_parsed * BLOCK_BYTES, hi_parsed * BLOCK_BYTES
+                filtered = [e for e in candidates if e.get("lo") == lo and e.get("hi") == hi]
+                if filtered:
+                    candidates = filtered
+                else:
+                    # Si no hay coincidencia exacta, nos quedamos con las candidatas generales
+                    debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] not found; using group/from/to fallback")
+
+        sat = any(bool(e.get("satisfied")) for e in candidates)
+        debug(f"[COND] sequence {fid}->{tid} candidates={len(candidates)} satisfied={sat}")
+        return sat, (node if sat else None)
+
+    # --- GROUPS (and/or de grupos) ---
+    if "groups" in node and isinstance(node["groups"], list):
+        op = str(node.get("operator", "and")).lower()
+        vals = [bool(g_truth.get(g, False)) for g in node["groups"]]
+        ok = all(vals) if op == "and" else any(vals)
+        return ok, (node if ok else None)
+
+    # --- AND ---
+    if "and" in node and isinstance(node["and"], list):
+        matched = []
+        for sub in node["and"]:
+            ok, m = _eval_condition_node(sub, g_truth, r_entry)
+            if not ok:
+                return False, None
+            matched.append(m or sub)
+        return True, {"and": matched}
+
+    # --- OR ---
+    if "or" in node and isinstance(node["or"], list):
+        for sub in node["or"]:
+            ok, m = _eval_condition_node(sub, g_truth, r_entry)
+            if ok:
+                return True, (m or sub)
         return False, None
+
+    return False, None
+
 
 def _rule_sequences_ok(r_entry, needed_groups: set | None = None) -> bool:
     """

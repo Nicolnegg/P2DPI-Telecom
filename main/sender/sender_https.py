@@ -265,32 +265,39 @@ def trigger_test_client_request():
     # )
 
     #Maldoc_VBA_macro_code - rule 2
-    fake_email= (
-        b"From: billing@corp.local\n"
-        b"To: user@example.com\n"
-        b"Subject: ZIP VBA macro test\n"
-        b"\n"
-        b"\x50\x4B\x03\x04\x14\x00\x08\x00\n"
-        b"vbaProject.bin\n"
-    )
+    # fake_email= (
+    #     b"From: billing@corp.local\n"
+    #     b"To: user@example.com\n"
+    #     b"Subject: ZIP VBA macro test\n"
+    #     b"\n"
+    #     b"\x50\x4B\x03\x04\x14\x00\x08\x00\n"
+    #     b"vbaProject.bin\n"
+    # )
 
     #WShell_ChinaChopper-rule1-1
-    fake_email= (
+    # fake_email= (
+    #     b"From: billing@corp.local\n"
+    #     b"To: user@example.com\n"
+    #     b"Subject: ChinaChopper ASPX test (len=10)\n"
+    #     b"\n"
+    #     b"\x25\x40\x20\x50\x61\x67\x65\x20\x4C\x61\x6E\x67\x75\x61\x67\x65\x3D"
+    #     b"\x10"
+    #     b"\x4A\x73\x63\x72\x69\x70\x74"
+    #     b"\x30"
+    #     b"\x25\x3E\x3C\x25\x65\x76\x61\x6C\x28\x52\x65\x71\x75\x65\x73\x74\x2E\x49\x74\x65\x6D\x5B"
+    #     b"\x66\x65"
+    # )
+
+    #WShell_ChinaChopper-rule2
+    fake_email = (
         b"From: billing@corp.local\n"
         b"To: user@example.com\n"
-        b"Subject: ChinaChopper ASPX test (len=10)\n"
+        b"Subject: ChinaChopper PHP test\n"
         b"\n"
-        b"\x25\x40\x20\x50\x61\x67\x65\x20\x4C\x61\x6E\x67\x75\x61\x67\x65\x3D"
-        b"\x10"
-        b"\x4A\x73\x63\x72\x69\x70\x74"
-        b"\x30"
-        b"\x25\x3E\x3C\x25\x65\x76\x61\x6C\x28\x52\x65\x71\x75\x65\x73\x74\x2E\x49\x74\x65\x6D\x5B"
-        b"\x66\x65"
+        b"\x3C\x3F\x70\x68\x70\x20\x40\x65\x76\x61\x6C\x28\x24\x5F\x50\x4F\x53\x54\x5B"
+        b"\x00"
+        b"\x70\x61\x73\x73\x77\x6F\x72\x64"
     )
-
-    #WShell_ChinaChopper-rule1-2
-    #fake_email = b"From: billing@corp.local\nTo: user@example.com\nSubject: ChinaChopper ASPX one-liner\n\n%@ Page Language=\"Jscript\"%><%eval(Request.Item[XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXunsafe)%>\n"
-
 
 
     data = (
