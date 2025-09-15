@@ -180,17 +180,9 @@ def fuse_groups_by_base(dictionary):
 # Canonical 8-byte expansions for common file magics
 _MZ_8B     = bytes.fromhex("4D 5A 90 00 03 00 00 00")  # "MZ" + canonical tail
 _CFB_8B    = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")  # Compound File Binary (OLE)
-_PDF_8B_LIST = [  # %PDF-x.y  -> exactly 8 bytes each
+_PDF_8B_LIST = [ 
     bytes.fromhex(h) for h in [
-        "25 50 44 46 2D 31 2E 30",  # %PDF-1.0
-        "25 50 44 46 2D 31 2E 31",
-        "25 50 44 46 2D 31 2E 32",
-        "25 50 44 46 2D 31 2E 33",
-        "25 50 44 46 2D 31 2E 34",
-        "25 50 44 46 2D 31 2E 35",
-        "25 50 44 46 2D 31 2E 36",
-        "25 50 44 46 2D 31 2E 37",
-        "25 50 44 46 2D 32 2E 30",  # %PDF-2.0
+        "25 50 44 46 20 20 20 20",  # %PDF
     ]
 ]
 

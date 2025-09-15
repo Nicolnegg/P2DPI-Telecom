@@ -266,19 +266,21 @@ def emit_canonical_tokens(view: bytes) -> List[Tuple[int, bytes]]:
         token = _pad_to_8(base + (b" " if len(base) < 8 else b""))
         out.append((start, token))
 
-    # D) Short words, but SKIP if followed by ':' or '=' (so we don't drop punctuation)
-    for m in re.finditer(r"\b([a-z0-9_]{1,7})\b", text):
-        word = m.group(1)
-        start = m.start(1)
-        end = m.end(1)
-        next_char = text[end:end+1]
-        if next_char in (":", "="):
-            continue  # let A or B handle "word:" / "word="
-        token = _pad_to_8(word.encode("latin-1"))
+    # D') Short words with OPTIONAL 1-char punctuation prefix (generic)
+    #     - Captures optional prefix from this set, then [a-z0-9_]{1,7}
+    #     - Skips if the next char is ':' or '=' (A/B already handle those)
+    PUNCT_PREFIX = r"[%#@$_/\.\-]"  # ajusta el set si lo necesitas
+    pattern = rf"(?<![a-z0-9_])(?P<prefix>{PUNCT_PREFIX})?(?P<word>[a-z0-9_]{{1,7}})\b(?![:=])"
+
+    for m in re.finditer(pattern, text):
+        prefix = m.group('prefix') or ""
+        word   = m.group('word')
+        start  = m.start(0)  # incluye el prefijo si existe
+        base   = (prefix + word).encode("latin-1")
+        token  = _pad_to_8(base)
         out.append((start, token))
 
     return out
-
 
 
 def merge_tokens(

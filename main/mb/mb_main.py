@@ -9,7 +9,7 @@
 # This file stays small; heavy lifting is in utils.py.
 
 from flask import Flask, request, jsonify
-import os , json
+import os, json
 import uuid
 import requests
 import logging
@@ -26,7 +26,8 @@ from mb_utils import (
 
 app = Flask(__name__)
 
-app.logger.setLevel(logging.DEBUG)
+# Keep logs quiet by default (warnings and errors only)
+app.logger.setLevel(logging.WARNING)
 
 # -------------------------
 # Config / Constants
@@ -40,7 +41,6 @@ CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca
 # -------------------------
 # Globals (runtime state)
 # -------------------------
-# Legacy placeholders for compatibility
 RULES = []
 S_INTERMEDIATE = []
 R_INTERMEDIATE = []
@@ -71,18 +71,14 @@ _kmb_buf_keepalive = None            # keep buffer reference alive
 
 
 def _ensure_kmb_loaded():
-    """
-    Ensure kMB is loaded into memory before we need it.
-    """
+    """Ensure kMB is loaded into memory before we need it."""
     global kmb, _kmb_buf_keepalive
     if kmb is not None:
         return
     try:
         kmb, _kmb_buf_keepalive = load_kmb_from_file()
-        app.logger.info("[MB] Loaded existing kMB from keys/kmb.key")
     except Exception as e:
         app.logger.warning(f"[MB] kMB not loaded yet: {e}")
-
 
 # -------------------------
 # Endpoints
@@ -108,14 +104,6 @@ def upload_rules():
     batch_id = str(uuid.uuid4())
     flat, rev_map = flatten_ruleset_from_rg(ruleset)
 
-    # --- DEBUG: forma del rev_map en el upload ---
-    try:
-        any_addr = next(iter(rev_map.values()))
-        app.logger.debug("[MB] rev_map(sample) at upload len=%s val=%s (total=%d)",
-                        len(any_addr), any_addr, len(rev_map))
-    except StopIteration:
-        app.logger.debug("[MB] rev_map empty at upload")
-
     BATCHES[batch_id] = {
         "ruleset": ruleset,
         "flat": flat,
@@ -124,41 +112,24 @@ def upload_rules():
         "receiver_I": {}
     }
 
-    app.logger.info(f"[MB] Received RG ruleset. batch_id={batch_id}, tokens={len(flat)}")
-
-    fanout_payload = {
-        "batch_id": batch_id,
-        "tokens": flat
-    }
-
-    # --- DEBUG: vista previa de lo que se envía al Sender ---
-    try:
-        app.logger.debug("[MB→Sender] payload preview: total_tokens=%d", len(fanout_payload["tokens"]))
-        app.logger.debug("[MB→Sender] first_4k=\n%s",
-                         json.dumps(fanout_payload, indent=2, ensure_ascii=False)[:4000])
-    except Exception:
-        pass
-
+    # Fan-out payload
+    fanout_payload = {"batch_id": batch_id, "tokens": flat}
 
     # Forward to Receiver (R)
     try:
         r_response = requests.post("http://localhost:10000/receive_rules", json=fanout_payload, timeout=5)
-        app.logger.info("[MB → R] /receive_rules: %s", r_response.status_code)
+        if r_response.status_code != 200:
+            app.logger.warning("[MB → R] /receive_rules returned %s", r_response.status_code)
     except Exception as e:
         app.logger.warning("[MB → R] Error: %s", e)
 
     # Forward to Sender (S)
     try:
         s_response = requests.post("http://localhost:11000/receive_rules", json=fanout_payload, timeout=5)
-        app.logger.info("[MB → S] /receive_rules: %s", s_response.status_code)
+        if s_response.status_code != 200:
+            app.logger.warning("[MB → S] /receive_rules returned %s", s_response.status_code)
     except Exception as e:
         app.logger.warning("[MB → S] Error: %s", e)
-
-    try:
-        app.logger.debug("[MB] Snapshot (no match):\n%s",
-                        json.dumps(snapshot_rule_status(RUNTIME), indent=2, ensure_ascii=False))
-    except Exception:
-        pass
 
     return jsonify({"status": "ok", "batch_id": batch_id}), 200
 
@@ -183,8 +154,6 @@ def receive_intermediate_sender():
         return jsonify({"error": "Unknown batch_id"}), 404
 
     BATCHES[batch_id]["sender_I"] = {int(x["seq"]): x["Ii"] for x in inter if "seq" in x and "Ii" in x}
-    app.logger.info(f"[MB] Got Sender intermediates for batch {batch_id}: {len(BATCHES[batch_id]['sender_I'])} items")
-
     return _try_finalize_batch(batch_id)
 
 
@@ -208,8 +177,6 @@ def receive_intermediate_receiver():
         return jsonify({"error": "Unknown batch_id"}), 404
 
     BATCHES[batch_id]["receiver_I"] = {int(x["seq"]): x["Ii"] for x in inter if "seq" in x and "Ii" in x}
-    app.logger.info(f"[MB] Got Receiver intermediates for batch {batch_id}: {len(BATCHES[batch_id]['receiver_I'])} items")
-
     return _try_finalize_batch(batch_id)
 
 
@@ -235,19 +202,16 @@ def _try_finalize_batch(batch_id: str):
     s_keys = set(sI.keys())
     r_keys = set(rI.keys())
     if s_keys != r_keys:
-        app.logger.error(f"[MB] Mismatch seq sets for batch {batch_id}. Aborting.")
         del BATCHES[batch_id]
         return jsonify({"error": "Seq set mismatch between S and R"}), 403
 
     for seq in s_keys:
         if (sI[seq] or "").strip().lower() != (rI[seq] or "").strip().lower():
-            app.logger.error(f"[MB] Ii mismatch at seq={seq} for batch {batch_id}. Aborting.")
             del BATCHES[batch_id]
             return jsonify({"error": "Ii mismatch between S and R"}), 403
 
     _ensure_kmb_loaded()
     if kmb is None:
-        app.logger.error("[MB] ERROR: kMB is None. Cannot compute session rules.")
         del BATCHES[batch_id]
         return jsonify({"error": "kMB not loaded"}), 500
 
@@ -259,12 +223,10 @@ def _try_finalize_batch(batch_id: str):
         out_buf = create_string_buffer(200)
         try:
             res = prf.FKH_inv_hex(c_char_p(Ii_hex), kmb, out_buf, 200)
-        except Exception as e:
-            app.logger.exception(f"[MB] Exception during FKH_inv_hex (seq={seq}): {e}")
+        except Exception:
             del BATCHES[batch_id]
             return jsonify({"error": "PRF error"}), 500
         if res != 1:
-            app.logger.error(f"[MB] FKH_inv_hex failed at seq={seq}")
             del BATCHES[batch_id]
             return jsonify({"error": f"FKH_inv failed at seq={seq}"}), 500
 
@@ -275,28 +237,7 @@ def _try_finalize_batch(batch_id: str):
     # Rebuild structured ruleset
     ruleset_in = state["ruleset"]
     revmap = state["revmap"]
-    # --- DEBUG: forma del rev_map al finalizar ---
-    try:
-        any_addr = next(iter(revmap.values()))
-        app.logger.debug("[MB] rev_map(sample) at finalize len=%s val=%s (total=%d)",
-                        len(any_addr), any_addr, len(revmap))
-    except StopIteration:
-        app.logger.debug("[MB] rev_map empty at finalize")
-
     final_ruleset = rebuild_session_ruleset(ruleset_in, revmap, seq_to_sj)
-
-     # --- DEBUG: resumen de session_tokens por string ---
-    try:
-        app.logger.debug("[MB] session rebuild done")
-        for r_i, rr in enumerate(final_ruleset.get("rules", [])):
-            for gk, gv in (rr.get("groups") or {}).items():
-                for si, it in enumerate(gv.get("strings", [])):
-                    st = it.get("session_tokens", [])
-                    pos_ok = sum(1 for x in st if x)
-                    alts = sum(len(x if isinstance(x, list) else [x]) for x in st if x)
-                    app.logger.debug("  r%s/%s/s%s: posiciones=%s alternativas=%s", r_i, gk, si, pos_ok, alts)
-    except Exception:
-        pass
 
     # Publish
     global SESSION_RULES, RULESET_SESSION
@@ -307,10 +248,6 @@ def _try_finalize_batch(batch_id: str):
     global RUNTIME, SJ_TARGETS
     RUNTIME, SJ_TARGETS = build_runtime_index(RULESET_SESSION)
     reset_runtime_state(RUNTIME)
-
-    app.logger.info(f"[MB] ✅ Finalized batch {batch_id}. session tokens: {len(SESSION_RULES)}")
-#    app.logger.debug("\n[MB] ===== FINAL RULESET (SESSION) =====\n%s\n[MB] ===== END =====\n",
-#                     pretty_print_ruleset(RULESET_SESSION))
 
     del BATCHES[batch_id]
     return jsonify({"status": "finalized", "session_rules_count": len(SESSION_RULES)}), 200
@@ -340,11 +277,9 @@ def receive_kmb():
         _kmb_buf_keepalive = create_string_buffer(kmb_hex_str.encode())
         kmb = c_char_p(_kmb_buf_keepalive.value)
 
-        app.logger.info(f"[MB] kMB saved in {kmb_path} and updated in memory.")
         return "kMB received", 200
 
-    except Exception as e:
-        app.logger.exception("[MB] Error in /receive_kmb: %s", e)
+    except Exception:
         return "Internal error", 500
 
 
@@ -364,22 +299,19 @@ def receive_tokens():
     tokens = data["encrypted_tokens"]
     c_hex = data["c"]
     counter = int(c_hex, 16)
-    app.logger.info(f"[MB] Received {len(tokens)} encrypted tokens with counter c={counter}")
 
-    # If no structured rules were loaded, just forward to Receiver as before
+    # If no structured rules were loaded, just forward to Receiver
     if not RULESET_SESSION or not RUNTIME or not SJ_TARGETS:
         payload = {"tokens": tokens, "counter": c_hex}
         try:
             response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
-            app.logger.info(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
             if response.status_code != 200:
                 return jsonify({"error": "Failed to store tokens at Receiver"}), 500
-        except Exception as e:
-            app.logger.exception(f"[MB] Critical error sending tokens to Receiver: {e}")
+        except Exception:
             return jsonify({"error": "Critical failure sending tokens to Receiver"}), 500
         return jsonify({"status": "ok", "note": "no structured rules loaded"}), 200
 
-    # Reset run state for this evaluation (optional; remove if you want to carry state cross-requests)
+    # Reset run state for this evaluation
     reset_runtime_state(RUNTIME)
 
     # Use the structured matching engine
@@ -393,37 +325,22 @@ def receive_tokens():
     )
 
     if alert:
-        try:
-            app.logger.debug("[MB] Match details g_truth: %s", json.dumps(details.get("g_truth", {}), ensure_ascii=False))
-            app.logger.debug("[MB] Clause hit: %s", json.dumps(details.get("cond", {}), ensure_ascii=False))
-            # Si quieres ver snapshot completo:
-            if details.get("snapshot"):
-                app.logger.debug("[MB] Snapshot at match:\n%s", json.dumps(details["snapshot"], indent=2, ensure_ascii=False))
-        except Exception:
-            pass
-
         # Notify Receiver to delete stored tokens for this counter and block
         try:
             delete_payload = {"counter": c_hex}
-            delete_response = requests.post(
-                RECEIVER_DELETE_URL,
-                json=delete_payload,
-                verify=CA_CERT_PATH,
-                timeout=5
-            )
-            app.logger.info(f"[MB ➜ R] Notify Receiver delete tokens: {delete_response.status_code} - {delete_response.text}")
-        except Exception as e:
-            app.logger.warning(f"[MB] Failed to notify Receiver about malicious tokens: {e}")
+            requests.post(RECEIVER_DELETE_URL, json=delete_payload, verify=CA_CERT_PATH, timeout=5)
+        except Exception:
+            pass
 
         return jsonify({
             "status": "alert",
             "message": "Rule conditions satisfied. Transmission blocked.",
-            "matched_at": details.get("matched_at"),
+            "matched_at": details.get("matched_at") if details else None,
             "debug": {
-                "rule_idx": details.get("rule_idx"),
-                "clause_idx": details.get("clause_idx"),
-                "g_truth": details.get("g_truth"),
-                "cond": details.get("cond")
+                "rule_idx": details.get("rule_idx") if details else None,
+                "clause_idx": details.get("clause_idx") if details else None,
+                "g_truth": details.get("g_truth") if details else None,
+                "cond": details.get("cond") if details else None
             }
         }), 403
 
@@ -431,28 +348,22 @@ def receive_tokens():
     payload = {"tokens": tokens, "counter": c_hex}
     try:
         response = requests.post(RECEIVER_URL, json=payload, verify=CA_CERT_PATH, timeout=5)
-        app.logger.info(f"[MB ➜ R] Store tokens response: {response.status_code} - {response.text}")
         if response.status_code != 200:
             return jsonify({"error": "Failed to store tokens at Receiver"}), 500
-    except Exception as e:
-        app.logger.exception(f"[MB] Critical error sending tokens to Receiver: {e}")
+    except Exception:
         return jsonify({"error": "Critical failure sending tokens to Receiver"}), 500
 
-    app.logger.info("[MB] ✅ No rule conditions satisfied. Traffic allowed.")
     return jsonify({"status": "ok"}), 200
-
 
 
 @app.route("/validation", methods=["POST"])
 def receive_alert_from_receiver():
-    """
-    Optional alert channel from Receiver (for validation audits).
-    """
+    """Optional alert channel from Receiver (for validation audits)."""
     alert_data = request.get_json()
     if not alert_data:
         return jsonify({"error": "Missing alert data"}), 400
-
-    app.logger.warning("\n[MB] ⚠️ ALERT RECEIVED FROM RECEIVER ⚠️\n[MB] Details: %s", alert_data)
+    # Keep as a warning so it shows up if someone enables INFO later.
+    app.logger.warning("[MB] ALERT FROM RECEIVER: %s", alert_data)
     return jsonify({"status": "Alert received"}), 200
 
 
@@ -460,7 +371,6 @@ if __name__ == "__main__":
     # Try load kMB (if the key file already exists) and h
     _ensure_kmb_loaded()
     if h_fixed:
-        app.logger.info("[MB] Loaded fixed point h")
+        app.logger.warning("[MB] Fixed point h loaded")
 
-    app.logger.info("[MB] Starting Flask server on port 9999...")
     app.run(host="0.0.0.0", port=9999)

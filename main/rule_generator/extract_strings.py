@@ -741,19 +741,86 @@ def yara_to_default_dict(yara_path: str) -> dict:
 
     return result
 
+def build_dictionary_from_folder(yara_dir: str, recursive: bool = False) -> dict:
+    """
+    Walk through `yara_dir` (optionally recursive), parse all .yar/.yara files,
+    and return a single merged dict containing all rules from all files.
+
+    Collision policy:
+      - If multiple rules share the same name, suffix them as name, name#2, name#3, ...
+        (Change `_unique_name` if you prefer a different namespacing scheme.)
+
+    Final structure:
+      {
+        "<rule_name>": { ...rule body... },
+        "<rule_name>#2": { ...rule body... }
+      }
+    """
+    exts = {".yar", ".yara"}
+    merged: dict = {}
+    seen_names: dict[str, int] = {}
+
+    def _unique_name(base: str) -> str:
+        """Return a unique rule name by appending #2, #3, ... on collisions."""
+        n = seen_names.get(base, 0) + 1
+        seen_names[base] = n
+        return base if n == 1 else f"{base}#{n}"
+
+    paths = []
+    yara_dir = os.path.abspath(yara_dir)
+
+    # Collect candidate files
+    if recursive:
+        for root, _, files in os.walk(yara_dir):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in exts:
+                    paths.append(os.path.join(root, fn))
+    else:
+        for fn in os.listdir(yara_dir):
+            p = os.path.join(yara_dir, fn)
+            if os.path.isfile(p) and os.path.splitext(fn)[1].lower() in exts:
+                paths.append(p)
+
+    # Stable order (optional): first by filename, then full path
+    paths.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
+
+    total_files = 0
+    total_rules = 0
+
+    for p in paths:
+        try:
+            d = yara_to_default_dict(p)  # <-- uses your existing converter
+        except Exception as e:
+            print(f"[WARN] Skipping '{p}' due to parse error: {e}")
+            continue
+
+        total_files += 1
+        for rname, rbody in (d or {}).items():
+            unique = _unique_name(rname)
+            merged[unique] = rbody
+            total_rules += 1
+
+    print(f"[INFO] Parsed {total_files} YARA file(s), {total_rules} rule(s) total.")
+    return merged
+
 
 # ----------------------------
 # Run conversion for a file
 # ----------------------------
+
 if __name__ == "__main__":
-    # Adjust this path to your YARA file
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    yara_path = os.path.join(script_dir, "YARA", "WShell_ChinaChopper.yar")
 
-    out = yara_to_default_dict(yara_path)
+    # Directory containing your .yar/.yara files
+    yara_dir = os.path.join(script_dir, "YARA")
 
-    # Write result to JSON near this script
+    # Build a single dictionary from the whole folder
+    out = build_dictionary_from_folder(yara_dir, recursive=False)  # set True if you want recursion
+
+    # Write merged JSON next to this script
     out_path = os.path.join(script_dir, "dictionary.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
+
     print(f"[OK] Wrote JSON to: {out_path}")
+

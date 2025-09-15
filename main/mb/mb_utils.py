@@ -1,7 +1,7 @@
 # middlebox/mb/utils.py
 #
 # Purpose:
-#   - Hold small, reusable, side‑effect‑free helpers for mb_main.py
+#   - Hold small, reusable, side-effect-free helpers for mb_main.py
 #   - Keep imports minimal and avoid Flask/server state here.
 #
 
@@ -71,9 +71,11 @@ def load_prf(shared_dir: str = None) -> CDLL:
 
     prf = CDLL(prf_path)
 
+    # int FKH_inv_hex(const char* kmb_hex, const char* h_hex, const char* ri_hex, char* out_hex_len);
     prf.FKH_inv_hex.argtypes = [c_char_p, c_char_p, c_char_p, c_int]
     prf.FKH_inv_hex.restype = c_int
 
+    # int H2(const uint8_t* y, int y_len, const uint8_t* key16, uint8_t* out16);
     prf.H2.argtypes = [
         POINTER(c_ubyte),
         c_int,
@@ -218,8 +220,6 @@ def rebuild_session_ruleset(ruleset_in: Dict[str, Any],
     return out
 
 
-
-
 def pretty_print_ruleset(ruleset: Dict[str, Any]) -> str:
     """
     Return a pretty-printed JSON string (sorted keys) for logging.
@@ -306,8 +306,6 @@ def flatten_ruleset_from_rg(ruleset: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     return flat_tokens, rev_map
 
 
-
-
 def reset_runtime_state(runtime):
     """Reset per-string run state (useful if you reuse the runtime across requests/batches)."""
     if not runtime:
@@ -328,7 +326,6 @@ def reset_runtime_state(runtime):
             e["satisfied"] = False
 
 
-
 def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
     """
     Actualiza el estado de un *string* cuando su token en 'token_pos' hace match en el índice i.
@@ -346,7 +343,7 @@ def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
         s_state["run_len"] = 1
         s_state["last_hit_i"] = traffic_i
         s_state["cur_start_i"] = traffic_i
-        s_state["bound_edge"] = None          
+        s_state["bound_edge"] = None
         if len(s_state["sj_list"]) == 1:
             s_state["done"] = True
             s_state["just_done_at"] = traffic_i
@@ -370,7 +367,7 @@ def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
             s_state["run_len"] = 1
             s_state["last_hit_i"] = traffic_i
             s_state["cur_start_i"] = traffic_i
-            s_state["bound_edge"] = None      
+            s_state["bound_edge"] = None
             s_state["done"] = (len(s_state["sj_list"]) == 1)
             s_state["just_done_at"] = (traffic_i if s_state["done"] else None)
         return
@@ -380,7 +377,7 @@ def _update_string_run_state(s_state, token_pos: int, traffic_i: int):
         s_state["run_len"] = 1
         s_state["last_hit_i"] = traffic_i
         s_state["cur_start_i"] = traffic_i
-        s_state["bound_edge"] = None 
+        s_state["bound_edge"] = None
         s_state["done"] = (len(s_state["sj_list"]) == 1)
         s_state["just_done_at"] = (traffic_i if s_state["done"] else None)
     else:
@@ -459,9 +456,27 @@ def _extract_enc_positions_from_string_item(s_item):
 
     return positions
 
+
+# ---------------------------
+# FIX: evaluación de condiciones
+# ---------------------------
 def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool, dict | None]:
+    """
+    Evalúa un subárbol de condiciones contra el mapa de verdad de grupos y secuencias.
+    Soporta:
+      - {"not": <subtree>}
+      - {"groups": [...], "operator": "and"|"or"|"not"|"none"}
+      - {"and": [ ... ]} / {"or": [ ... ]}
+      - {"sequence": {"group": "...", "from": "...", "to": "...", "op": "RANGE_A_B" | "ONE_WILDCARD"}}
+    """
     if not isinstance(node, dict):
         return False, None
+
+    # --- Unary NOT sobre cualquier subtree ---
+    if "not" in node:
+        sub = node["not"]
+        ok, _ = _eval_condition_node(sub, g_truth, r_entry)
+        return (not ok), ({"not": sub} if not ok else None)
 
     # --- SEQUENCE ---
     if "sequence" in node and isinstance(node["sequence"], dict):
@@ -469,7 +484,7 @@ def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool
         gid = str(s.get("group", ""))
         fid = str(s.get("from", "")); tid = str(s.get("to", ""))
 
-        # 1) Candidatas por (group, from, to)
+        # Candidatas por (group, from, to)
         candidates = [e for e in r_entry.get("seq_edges", [])
                       if e.get("group") == gid and e.get("from_id") == fid and e.get("to_id") == tid]
 
@@ -477,31 +492,42 @@ def _eval_condition_node(node: dict, g_truth: dict, r_entry: dict) -> tuple[bool
             debug(f"[COND] sequence {fid}->{tid} no edge (group={gid}) in runtime")
             return False, None
 
-        # 2) Si hay 'op' reconocido, filtramos por (lo,hi) EN TOKENS;
-        #    si no, usamos las candidatas tal cual.
-        lo = hi = None
+        # Si hay un 'op' reconocible, traducir a TOKENS como en build_runtime_index:
+        # build_runtime_index: lo_tokens = BASE + lo_bytes, hi_tokens = BASE + hi_bytes
+        # aquí lo/hi del op son 'abstractos' (unidades base), así que sumamos BASE.
         op = s.get("op", "")
+        lo_tok = hi_tok = None
         if isinstance(op, str):
-            lo_parsed, hi_parsed = _parse_sequence_op(op)  # devuelve números "abstractos"
+            lo_parsed, hi_parsed = _parse_sequence_op(op)
             if lo_parsed or hi_parsed:
-                # ¡OJO! seq_edges YA están en TOKENS; aquí NO volvemos a multiplicar.
-                lo, hi = lo_parsed * BLOCK_BYTES, hi_parsed * BLOCK_BYTES
-                filtered = [e for e in candidates if e.get("lo") == lo and e.get("hi") == hi]
+                BASE = BLOCK_BYTES - 1
+                lo_tok = BASE + lo_parsed
+                hi_tok = BASE + hi_parsed
+                filtered = [e for e in candidates if e.get("lo") == lo_tok and e.get("hi") == hi_tok]
                 if filtered:
                     candidates = filtered
                 else:
-                    # Si no hay coincidencia exacta, nos quedamos con las candidatas generales
-                    debug(f"[COND] sequence {fid}->{tid} [{lo},{hi}] not found; using group/from/to fallback")
+                    debug(f"[COND] sequence {fid}->{tid} [{lo_tok},{hi_tok}] not found; using group/from/to fallback")
 
         sat = any(bool(e.get("satisfied")) for e in candidates)
         debug(f"[COND] sequence {fid}->{tid} candidates={len(candidates)} satisfied={sat}")
         return sat, (node if sat else None)
 
-    # --- GROUPS (and/or de grupos) ---
+    # --- GROUPS (and/or/not/none sobre valores de verdad de grupos) ---
     if "groups" in node and isinstance(node["groups"], list):
         op = str(node.get("operator", "and")).lower()
         vals = [bool(g_truth.get(g, False)) for g in node["groups"]]
-        ok = all(vals) if op == "and" else any(vals)
+
+        if op in ("and", "all"):
+            ok = all(vals)
+        elif op in ("or", "any"):
+            ok = any(vals)
+        elif op in ("not", "none"):
+            ok = not any(vals)
+        else:
+            # Fallback sensato: 'and'
+            ok = all(vals)
+
         return ok, (node if ok else None)
 
     # --- AND ---
@@ -537,7 +563,6 @@ def _rule_sequences_ok(r_entry, needed_groups: set | None = None) -> bool:
         if not e.get("satisfied"):
             return False
     return True
-
 
 
 def process_encrypted_tokens_with_conditions(
@@ -716,7 +741,6 @@ def process_encrypted_tokens_with_conditions(
     return False, {"snapshot": snapshot_rule_status(runtime)}
 
 
-
 def _group_truth_map(rule_entry):
     """
     Devuelve {group_key: bool}. Para 'cadena', exige >=1 string done por cada seg_id
@@ -778,7 +802,7 @@ def _eval_groups_and_conditions(runtime) -> bool:
         if not _rule_sequences_ok(r):    # <-- hard gate
             continue
 
-        # 2) grupos (como ya tenías)
+        # 2) grupos
         g_truth = _group_truth_map(r)
         conds = r.get("conditions", [])
         if not conds:
@@ -786,8 +810,7 @@ def _eval_groups_and_conditions(runtime) -> bool:
                 return True
             continue
 
-        # 3) respeta OR/AND del JSON (no lo fuerces a AND implícito)
-        #    Evalúa el árbol tal cual está
+        # 3) respeta el árbol tal cual está
         ok, _ = _eval_condition_node(conds[0] if len(conds) == 1 else {"and": conds}, g_truth, r)
         if ok:
             return True
@@ -803,7 +826,7 @@ def _eval_groups_and_conditions_with_details(runtime):
             print(f"[EVAL] rule {r_idx} sequences NOT OK -> skip")
             for idx, e in enumerate(r.get("seq_edges", [])):
                 print(f"   edge={idx} sat={e['satisfied']} pend={e['pending']} "
-                    f"({e['from_id']}->{e['to_id']} lo={e['lo']} hi={e['hi']})")
+                      f"({e['from_id']}->{e['to_id']} lo={e['lo']} hi={e['hi']})")
             continue
 
         # 2) grupos
@@ -819,7 +842,6 @@ def _eval_groups_and_conditions_with_details(runtime):
         debug(f"[EVAL] rule {r_idx} g_truth={g_truth} ok={ok} matched={matched}")
 
         if ok:
-
             return True, {
                 "rule_idx": r_idx,
                 "clause_idx": None,
@@ -827,9 +849,6 @@ def _eval_groups_and_conditions_with_details(runtime):
                 "cond": matched
             }
     return False, None
-
-
-
 
 
 # --- Match-type normalization ----------------------------------------------
@@ -879,7 +898,6 @@ def _normalize_match_type(mt_raw, total_strings: int) -> tuple[str, int]:
 
     # Fallback (behave like 'any')
     return ("atleast", 1)
-
 
 
 def snapshot_rule_status(runtime):
@@ -989,7 +1007,7 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
                 "match_type": mt_norm,
                 "threshold": None,
                 "strings": [],
-                "seg_index": {}     # { seg_id: [s_idx, ...] }  <-- lista (¡no uno solo!)
+                "seg_index": {}     # { seg_id: [s_idx, ...] }
             }
 
             for s_idx, s_item in enumerate(g_val.get("strings", [])):
@@ -1082,7 +1100,7 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
         # === Engancha edges de sequence para este rule ===
         edges = _gather_sequence_edges(r_entry["conditions"])
         for e in edges:
-            # e["lo"], e["hi"] vienen en BYTES -> conviértelo a TOKENS con BASE=BLOCK_BYTES-1
+            # e["lo"], e["hi"] vienen en BYTES "abstractos" -> a TOKENS con BASE=BLOCK_BYTES-1
             BASE = BLOCK_BYTES - 1
             lo_tokens = BASE + e["lo"]
             hi_tokens = BASE + e["hi"]
@@ -1105,9 +1123,9 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
             })
 
             print("[IDX][EDGE] "
-                f"group={e['group']} from={e['from_id']} to={e['to_id']} "
-                f"lo_bytes={e['lo']} hi_bytes={e['hi']} "
-                f"-> lo_tokens={lo_tokens} hi_tokens={hi_tokens}")
+                  f"group={e['group']} from={e['from_id']} to={e['to_id']} "
+                  f"lo_bytes={e['lo']} hi_bytes={e['hi']} "
+                  f"-> lo_tokens={lo_tokens} hi_tokens={hi_tokens}")
 
             gk = e["group"]
             # mapear FROM
@@ -1126,7 +1144,3 @@ def build_runtime_index(final_ruleset: Dict[str, Any]):
         runtime["rules"].append(r_entry)
 
     return runtime, sj_to_targets
-
-
-
-

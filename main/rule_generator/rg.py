@@ -33,13 +33,19 @@ DEBUG_TOKENS = True
 
 _BASE_RX = re.compile(r"^([a-zA-Z0-9]+)")
 
-MIN_SEG_BYTES = 7  # drop si len(bytes) < 7  (<=6)
+# Minimum segment size for chain segments: drop if len(bytes) < 7 (<= 6)
+MIN_SEG_BYTES = 7
 
 
 def _ascii_safe(b: bytes) -> str:
+    """Render bytes to a printable ASCII (non-printables as dots)."""
     return ''.join(chr(x) if 32 <= x <= 126 else '.' for x in b)
 
 def _dbg_dump_tokens(label: str, original: str, view: bytes, tokens) -> None:
+    """
+    Debug helper to print token information.
+    Handles both a flat list of tokens and a list of token-groups.
+    """
     if not DEBUG_TOKENS:
         return
     try:
@@ -48,7 +54,7 @@ def _dbg_dump_tokens(label: str, original: str, view: bytes, tokens) -> None:
             prev = view[:80]
             print(f"[RG][DBG] normalized(bytes)={prev!r}{' ...' if len(view) > 80 else ''}")
 
-        # Handle both flat list of bytes and list of list of bytes
+        # tokens can be List[bytes] or List[List[bytes]]
         if tokens and isinstance(tokens[0], list):
             for i, group in enumerate(tokens):
                 for j, t in enumerate(group):
@@ -59,7 +65,6 @@ def _dbg_dump_tokens(label: str, original: str, view: bytes, tokens) -> None:
 
     except Exception as e:
         print(f"[RG][DBG] dump error: {e}")
-
 
 
 # --- Load PRF shared library (compiled C code) ---
@@ -85,114 +90,111 @@ with open(h_path, 'r') as f:
 
 # --- Paths ---
 DICT_PATH = os.path.join(current_dir, "dictionary.json")   # input (YARA → default dict)
-MB_URL    = "http://localhost:9999/upload_rules"        # output endpoint at MB
+MB_URL    = "http://localhost:9999/upload_rules"           # MB endpoint for rules
 
 
 # ---------- PRF wrapper: obfuscate a single 8-byte token ----------
 
 def obfuscate_token_fkh(token8: bytes) -> str:
     """
-    Obfuscate one 8-byte token using FKH (key-homomorphic PRF).
-    Returns ASCII-hex string (Ri).
+    Obfuscate a single 8-byte token using FKH (key-homomorphic PRF).
+    Returns the ASCII-hex string Ri (FKH_hex output).
     """
     out = create_string_buffer(200)
     res = prf.FKH_hex(
-        c_char_p(token8),                         # raw bytes as PRF input
-        c_char_p(K_MB_HEX.encode("utf-8")),       # kMB hex
-        c_char_p(h_fixed_hex.encode("utf-8")),    # h hex
+        c_char_p(token8),                         # raw 8-byte input
+        c_char_p(K_MB_HEX.encode("utf-8")),       # kMB as hex
+        c_char_p(h_fixed_hex.encode("utf-8")),    # h as hex
         out,
         200
     )
     if res != 1:
         raise RuntimeError("FKH_hex failed for a token")
-    return out.value.decode()  # ASCII hex
+    return out.value.decode()  # ASCII hex Ri
 
 
 # ---------- Builders for enc_tokens per string item ----------
 
 def _enc_tokens_for_string_value(text: str) -> List[Dict[str, str]]:
     """
-    Build enc_tokens for a textual value:
+    Build enc_tokens for a text value:
       - Mirror Sender’s tokenization (normalization + sliding/canonical)
-      - For each 8-byte token: obfuscate + sign
-    Returns a list of {"ri": "<hex>", "sig": "<base64>"}.
+      - For each 8-byte token: PRF-obfuscate (Ri) + RSA-PSS sign
+    Returns: [{"ri": "<hex>", "sig": "<base64>"} ...]
     """
     tokens = emit_tokens_for_pattern(text)
-    view = normalize_view_text(text)  
+    view = normalize_view_text(text)
     _dbg_dump_tokens("str", text, view, tokens)
 
     enc_list: List[Dict[str, str]] = []
-
     if not tokens:
         return enc_list
-    # Load private key once at module-level? Keep simple: load here via closure from outer scope.
+
+    # Load private key once at module init via outer scope (see generate_and_send_ruleset)
     for t in tokens:
         ri_hex = obfuscate_token_fkh(t)
         sig_b64 = sign_data(ri_hex, _PRIVATE_KEY)
         enc_list.append({"ri": ri_hex, "sig": sig_b64})
     return enc_list
 
-# ---------- Builders for enc_tokens per string item (REPLACEMENTS) ----------
 
 def _enc_tokens_for_hex_value(hex_text: str) -> List[List[Dict[str, str]]]:
     """
     Build enc_tokens for a plain hex literal (no wildcards).
-    Returns a list of groups: each group is a list of {"ri","sig"} dicts.
-
-    Reason: emit_tokens_for_hex_literal() returns List[List[bytes]] where each inner list
-    corresponds to a logical group/variant for that string. We preserve that grouping
-    so callers can create one {"enc_tokens": ...} per group (not merge groups from
-    different strings).
+    Returns a list of groups, because emit_tokens_for_hex_literal() yields
+    List[List[bytes]] where each inner list is one logical variant-group.
+    We preserve that grouping so callers can emit one {"enc_tokens": ...}
+    per variant group.
     """
     tokens_groups = emit_tokens_for_hex_literal(hex_text)
     _dbg_dump_tokens("hex", hex_text, b"", tokens_groups)
 
     groups_out: List[List[Dict[str, str]]] = []
-
-    for group in tokens_groups:          # group is List[bytes]
+    for group in tokens_groups:          # group: List[bytes]
         enc_list: List[Dict[str, str]] = []
-        for t in group:                  # t is bytes
+        for t in group:
             ri_hex = obfuscate_token_fkh(t)
             sig_b64 = sign_data(ri_hex, _PRIVATE_KEY)
             enc_list.append({"ri": ri_hex, "sig": sig_b64})
         if enc_list:
             groups_out.append(enc_list)
-
     return groups_out
 
 
 def _process_group_simple(group_obj: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Simple group processing:
+    Process a simple group:
       - Preserve the group's match_type EXACTLY AS PROVIDED:
         * can be "all", "any", "cadena", or a numeric threshold (e.g., 14)
       - Accept both shapes for items:
         * homogeneous lists (["abc", "def"]) guided by group-level data_type
         * per-item typed lists ([{"data_type":"string","value":"..."}, ...])
       - Output format (no cleartext, no data_type):
-        { "match_type": <same as input>, "strings": [ { "enc_tokens":[...] }, ... ] }
+        {
+          "match_type": <as input or int>,
+          "strings": [ { "enc_tokens":[...] }, ... ]
+        }
     """
-    # 1) Preserve match_type exactly, but if it is a digit string like "14" -> convert to int 14.
+    # 1) Preserve match_type as-is, but convert numeric strings to int
     mt_in = group_obj.get("match_type", "all")
     if isinstance(mt_in, str) and mt_in.isdigit():
-        match_type = int(mt_in)   # MB can enforce "matches >= 14"
+        match_type = int(mt_in)
     else:
-        match_type = mt_in        # keep "all"/"any"/"cadena" (or int) as-is
+        match_type = mt_in
 
-    # 2) Gather items (strings) and detect the shape
+    # 2) Collect items and detect shape
     items = group_obj.get("strings", [])
     strings_out: List[Dict[str, Any]] = []
 
-    # Detect per-item typed entries:
     per_item_typed = bool(items) and isinstance(items[0], dict) and "value" in items[0]
 
     if per_item_typed:
-        # Per-item typing — respect each item’s data_type
+        # Per-item type respected
         for it in items:
             v = it.get("value", "")
             t = (it.get("data_type", "string") or "string").strip().lower()
             if t == "hex":
-                # _enc_tokens_for_hex_value now returns List[List[dict]]
+                # _enc_tokens_for_hex_value returns List[List[dict]]
                 groups = _enc_tokens_for_hex_value(v)
                 for enc_group in groups:
                     if enc_group:
@@ -207,7 +209,6 @@ def _process_group_simple(group_obj: Dict[str, Any]) -> Dict[str, Any]:
         if dtype == "hex":
             for v in items:
                 groups = _enc_tokens_for_hex_value(v)
-                # append one entry per inner-group
                 for enc_group in groups:
                     if enc_group:
                         strings_out.append({"enc_tokens": enc_group})
@@ -217,20 +218,21 @@ def _process_group_simple(group_obj: Dict[str, Any]) -> Dict[str, Any]:
                 if enc:
                     strings_out.append({"enc_tokens": enc})
 
-    # IMPORTANT: return match_type exactly as we received it (could be int)
     return {"match_type": match_type, "strings": strings_out}
 
 
 def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
                           seq_next_op_map: Dict[str, str]) -> tuple[Dict[str, Any], Dict[str, str], set, set, Dict[str, int], List[str]]:
     """
-    Devuelve:
-      - grupo_listo (sin 'value' en claro, con enc_tokens)
-      - sid_map: {id_original -> id_ofuscado} (solo de kept)
-      - absorbed_from: set(ids 'from' que absorbieron 1 byte)
-      - dropped_sids: set(ids originales de segmentos omitidos por < MIN_SEG_BYTES)
-      - seg_len_map: {id_original -> len_en_bytes} (de todos, útil para componer gaps)
-      - kept_order: [ids originales en orden], solo los conservados
+    Process a 'cadena' (chained hex with gaps) group.
+
+    Returns:
+      - group_ready:   {"match_type":"cadena","strings":[ ...no cleartext... ]}
+      - sid_map:       {orig_id -> new_id} (only for kept segments)
+      - absorbed_from: set(orig_ids) whose 7B segment absorbed 1B on the right
+      - dropped_sids:  set(orig_ids) that were dropped for being < MIN_SEG_BYTES
+      - seg_len_map:   {orig_id -> length_in_bytes} (all segments)
+      - kept_order:    [orig_ids ...] of segments kept, in original order
     """
     strings_in = group_obj.get("strings", [])
     strings_out: List[Dict[str, Any]] = []
@@ -250,7 +252,7 @@ def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
 
         seg_len_map[orig_sid] = len(b)
 
-        # --- drop si < 7 bytes ---
+        # Drop too-short segments (< 7B) for tokenization consistency
         if len(b) < MIN_SEG_BYTES:
             if DEBUG_TOKENS:
                 print(f"[RG][DROP] gid={gid} orig_sid={orig_sid} len={len(b)} < {MIN_SEG_BYTES} -> drop")
@@ -261,7 +263,7 @@ def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
         sid_map[orig_sid] = new_sid
         kept_order.append(orig_sid)
 
-        # ¿absorción de 7 bytes?
+        # Decide whether to absorb one byte on the right (7B -> 8B) based on the next-op gap
         do_absorb = (
             len(b) == 7 and
             orig_sid in seq_next_op_map and
@@ -272,11 +274,10 @@ def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
                   f"op_next={seq_next_op_map.get(orig_sid)} -> {do_absorb}")
 
         if do_absorb:
-            variants = _enc_variants_for_hex7_absorb_right_from_hex(val)  # List[List[dict]]
+            variants = _enc_variants_for_hex7_absorb_right_from_hex(val)  # List[List[dict]] (256 variants)
             absorbed_from.add(orig_sid)
 
-            # Opción A (lo que pides): exponer las 256 opciones bajo "value"
-            #   "value": [ {"enc_tokens":[...]}, {"enc_tokens":[...]}, ... x256 ]
+            # Expose 256 alternatives as a 'value' array of {"enc_tokens":[...]} entries
             strings_out.append({
                 "id": new_sid,
                 "value": [{"enc_tokens": v} for v in variants]
@@ -297,12 +298,12 @@ def _process_group_cadena(group_obj: Dict[str, Any], gid: str,
     )
 
 
-
-# --- Helpers para absorción de 7 bytes en cadena ---
+# --- Helpers for 'cadena' absorption of 7-byte segments ---
 
 _HEX_SP_RE = re.compile(r"\s+")
 
 def _hex_to_bytes(hex_text: str) -> bytes:
+    """Convert a hex-with-spaces string (with optional {...}) into raw bytes."""
     s = hex_text.strip()
     if s.startswith("{") and s.endswith("}"):
         s = s[1:-1].strip()
@@ -312,6 +313,7 @@ def _hex_to_bytes(hex_text: str) -> bytes:
 
 
 def _first_group_name_for_base(conditions: List[Dict[str, Any]], base: str) -> str | None:
+    """Find the first 'sequence' node whose group has the given base name."""
     for n in conditions or []:
         if "sequence" in n and isinstance(n["sequence"], dict):
             g = str(n["sequence"].get("group", ""))
@@ -321,11 +323,13 @@ def _first_group_name_for_base(conditions: List[Dict[str, Any]], base: str) -> s
 
 
 def _ascii_lower_bytes_local(b: bytes) -> bytes:
+    """Lowercase ASCII letters in bytes (A-Z -> a-z); other bytes unchanged."""
     return bytes(x + 32 if 65 <= x <= 90 else x for x in b)
 
 def _op_allows_absorb(op: str) -> bool:
     """
-    True si hay al menos 1 byte de holgura entre 'from' y 'to'.
+    True if there is at least 1 byte of slack between 'from' and 'to'.
+    Accepts ONE_WILDCARD or RANGE_m_n with both m,n >= 1.
     """
     if not isinstance(op, str):
         return False
@@ -336,11 +340,11 @@ def _op_allows_absorb(op: str) -> bool:
     if not m:
         return False
     lo, hi = int(m.group(1)), int(m.group(2))
-    return hi >= 1 and lo >= 1  # exigimos al menos 1 como mínimo (consumimos 1)
+    return hi >= 1 and lo >= 1  # must be able to “consume” 1 byte
 
 def _adjust_op_minus_one(op: str) -> str:
     """
-    Resta exactamente 1 byte al hueco del salto.
+    Subtract exactly 1 byte from the gap of the transition.
     ONE_WILDCARD -> RANGE_0_0
     RANGE_m_n    -> RANGE_{max(0,m-1)}_{max(0,n-1)}
     """
@@ -353,23 +357,22 @@ def _adjust_op_minus_one(op: str) -> str:
         lo2 = max(0, lo - 1)
         hi2 = max(0, hi - 1)
         return f"RANGE_{lo2}_{hi2}"
-    return op  # desconocido: no tocamos
+    return op  # unknown -> leave unchanged
 
 def _collect_seq_nextops_by_group(conditions: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     """
-    Devuelve: { group_key : { from_id : op_str } }
-    Donde group_key incluye:
-      - el nombre tal cual aparece en conditions
-      - y también su base en minúsculas (para empatar tras el fuse)
+    Build: { group_key : { from_id : op_str } }
+    Keys include both the original name and its lowercase base name,
+    so we can match sequences after group-base fusion.
     """
     out: Dict[str, Dict[str, str]] = {}
 
     def _add(g: str, f: str, op: str):
         if not g or not f:
             return
-        # clave con el nombre exacto
+        # exact group name
         out.setdefault(g, {})[f] = op
-        # clave con la base en minúsculas (tras el fuse)
+        # base in lowercase
         base = _base_name(g).lower()
         out.setdefault(base, {})[f] = op
 
@@ -390,6 +393,9 @@ def _collect_seq_nextops_by_group(conditions: List[Dict[str, Any]]) -> Dict[str,
     return out
 
 def _collect_edges_for_group_base(conditions: List[Dict[str, Any]], base: str) -> Dict[str, tuple[str, str]]:
+    """
+    For a given group base, collect edges as: {from_id: (to_id, op_str)}.
+    """
     edges: Dict[str, tuple[str, str]] = {}
     for n in conditions or []:
         if "sequence" in n and isinstance(n["sequence"], dict):
@@ -408,12 +414,15 @@ def _rebuild_sequences_cadena_by_base(conditions: List[Dict[str, Any]],
                                       kept_order: List[str],
                                       dropped_sids: set,
                                       seg_len_map: Dict[str, int]) -> List[Dict[str, Any]]:
-    # Usa el nombre original tal como aparece en conditions (para que luego remapee a gN)
+    """
+    Rebuild sequence constraints for a 'cadena' group after dropping short segments.
+    We accumulate gaps (including the byte lengths of dropped middle segments).
+    """
+    # Use the original group name (as appears in conditions) to keep later remapping consistent
     orig_group_name = _first_group_name_for_base(conditions, base) or base
-
     edges = _collect_edges_for_group_base(conditions, base)
 
-    # Elimina TODAS las sequence cuyo group tenga ese base
+    # Remove existing sequences for this group-base
     kept_nodes: List[Dict[str, Any]] = []
     for n in conditions or []:
         if "sequence" in n and isinstance(n["sequence"], dict):
@@ -422,7 +431,7 @@ def _rebuild_sequences_cadena_by_base(conditions: List[Dict[str, Any]],
                 continue
         kept_nodes.append(n)
 
-    # Crea las nuevas sequence entre kept consecutivos (sumando gaps + bytes de dropeados intermedios)
+    # Recreate direct sequences between consecutive kept segments
     new_seq_nodes: List[Dict[str, Any]] = []
     for i in range(len(kept_order) - 1):
         start = kept_order[i]
@@ -433,6 +442,7 @@ def _rebuild_sequences_cadena_by_base(conditions: List[Dict[str, Any]],
         total_hi = 0
         ok = True
 
+        # Walk the original chain aggregating gaps and dropped segment lengths
         while cur != end:
             if cur not in edges:
                 ok = False
@@ -459,6 +469,7 @@ def _rebuild_sequences_cadena_by_base(conditions: List[Dict[str, Any]],
 _OP_RX = re.compile(r"^RANGE_(\d+)_(\d+)$")
 
 def _parse_op_to_range(op: str) -> tuple[int, int]:
+    """Convert an op string to (lo, hi) gap range."""
     if not isinstance(op, str):
         return (0, 0)
     opu = op.strip().upper()
@@ -468,34 +479,18 @@ def _parse_op_to_range(op: str) -> tuple[int, int]:
     if m:
         lo, hi = int(m.group(1)), int(m.group(2))
         return (lo, hi)
-    # Desconocido -> conservador
+    # unknown -> conservative zero gap
     return (0, 0)
 
 def _format_range(lo: int, hi: int) -> str:
+    """Format a (lo, hi) gap range into 'RANGE_lo_hi' (non-negative)."""
     lo = max(0, lo); hi = max(0, hi)
     return f"RANGE_{lo}_{hi}"
 
-def _collect_edges_for_group(conditions: List[Dict[str, Any]], group_name: str) -> Dict[str, tuple[str, str]]:
-    """
-    Devuelve un grafo simple de aristas 'from' -> (to, op) SOLO del grupo dado.
-    Asume 1 salto por nodo 'from' (cadena típica).
-    """
-    edges: Dict[str, tuple[str, str]] = {}
-    for n in conditions or []:
-        if "sequence" in n and isinstance(n["sequence"], dict):
-            seq = n["sequence"]
-            if str(seq.get("group", "")) == group_name:
-                f = str(seq.get("from", ""))
-                t = str(seq.get("to", ""))
-                op = str(seq.get("op", "RANGE_0_0"))
-                if f and t:
-                    edges[f] = (t, op)
-    return edges
-
 def _enc_variants_for_hex7_absorb_right_from_hex(hex_text: str) -> List[List[Dict[str, str]]]:
     """
-    Devuelve 256 variantes separadas (cada variante = 1 token firmado).
-    Además, si DEBUG_TOKENS, imprime los 256 tokens crudos que se usaron.
+    Generate 256 independent variants for a 7-byte segment by absorbing one extra byte (0..255).
+    Each variant is a list with a single {"ri","sig"} token.
     """
     b7 = _hex_to_bytes(hex_text)
     if len(b7) != 7:
@@ -506,7 +501,7 @@ def _enc_variants_for_hex7_absorb_right_from_hex(hex_text: str) -> List[List[Dic
         raw_tokens_8: List[bytes] = []
 
     for x in range(256):
-        t8 = _ascii_lower_bytes_local(b7 + bytes([x]))  # token de 8 bytes que se ofusca
+        t8 = _ascii_lower_bytes_local(b7 + bytes([x]))  # 8-byte token to obfuscate
         if DEBUG_TOKENS:
             raw_tokens_8.append(t8)
 
@@ -515,17 +510,17 @@ def _enc_variants_for_hex7_absorb_right_from_hex(hex_text: str) -> List[List[Dic
         variants.append([{"ri": ri_hex, "sig": sig_b64}])
 
     if DEBUG_TOKENS:
-        # Muestra los 256 tokens crudos usados para ofuscar
+        # Show the 256 raw 8-byte tokens used
         _dbg_dump_tokens("hex7absorb", hex_text, b7, raw_tokens_8)
 
     return variants
-
 
 
 # ---------- Conditions remapping (original group names -> "g1","g2",...) ----------
 def _remap_condition_node(node: Dict[str, Any],
                           name_map: Dict[str, str],
                           sid_maps: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    """Remap group names (and 'from'/'to' IDs for sequences) into opaque gN identifiers."""
     def _to_gid(gname: str) -> str:
         base = _base_name(str(gname)).lower()
         return name_map.get(base, name_map.get(gname, gname))
@@ -558,12 +553,11 @@ def _remap_condition_node(node: Dict[str, Any],
     return dict(node)
 
 
-
 # --- Bucket merge (merge physical groups like url_1, url_2 → url) ---
 
 def _base_name(name: str) -> str:
     """
-    Extract logical base from a group name.
+    Extract a logical base from a group name.
     Example: 'url_1' -> 'url', 'eml_2' -> 'eml', 'greeting' -> 'greeting'.
     Rule: take the first alphanumeric run.
     """
@@ -572,8 +566,8 @@ def _base_name(name: str) -> str:
 
 def _gather_condition_bases(conditions: list[dict]) -> set[str]:
     """
-    Collect all group names mentioned in 'conditions'.
-    Used later to prioritize order of g1,g2,...
+    Collect base names of all groups referenced in 'conditions'.
+    Used to prioritize g1,g2,... ordering for determinism.
     """
     out = set()
     def walk(node: dict):
@@ -600,14 +594,13 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
 
     Policy:
       - Keep 'cadena' buckets untouched.
-      - If any numeric thresholds are present across merged groups (e.g., "14"),
-        preserve a numeric match_type (we pick max(k) for safety).
+      - If numeric thresholds exist across merged groups (e.g., 14), choose max(k) for safety.
       - Otherwise:
           * 'all' if all are 'all'
           * 'any' if all are 'any'
-          * 'any' if mixed (documented permissive default)
+          * 'any' if mixed or empty (permissive default)
       - Resolve data_type: 'string' | 'hex' | 'mixed'
-      - Keep per-item {"value","data_type"} entries when mixed; otherwise flatten.
+      - Keep per-item {"value","data_type"} entries when mixed; otherwise flatten into values.
     """
     groups_in: dict = rule_obj.get("groups", {})
 
@@ -621,7 +614,7 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
     for orig_name, gobj in groups_in.items():
         base = _base_name(orig_name)
 
-        # --- Preserve match_type as provided (could be int or str) ---
+        # Preserve match_type (int or str)
         mt_raw = gobj.get("match_type", "all")
         if isinstance(mt_raw, int):
             buckets[base]["ks"].append(mt_raw)
@@ -639,14 +632,13 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
         if mts is not None:
             buckets[base]["pols_str"].add(mts)
 
-        # Handle 'cadena' specially: keep raw segments and mark as hex
+        # 'cadena' is special: keep raw segments, mark as hex
         if isinstance(mt_raw, str) and mt_raw.strip().lower() == "cadena":
             buckets[base]["strings"].extend(gobj.get("strings", []))  # [{'id','value'}, ...]
             buckets[base]["types"].add("hex")
-            # policy already recorded above
             continue
 
-        # Normalize items into a consistent shape for later flattening
+        # Normalize items to a consistent shape
         dt = (gobj.get("data_type", "string") or "string").strip().lower()
         if dt == "mixed":
             for it in gobj.get("strings", []):
@@ -679,8 +671,7 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
 
         # 2) Decide match_type
         if ks:
-            # Numeric k-of-n: choose a consistent policy (max is safer/stricter)
-            match_type = max(ks)  # emitted as an integer
+            match_type = max(ks)  # numeric k-of-n: pick max for stricter policy
         else:
             only_all = pols == {"all"}
             only_any = pols == {"any"}
@@ -691,7 +682,7 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
             else:
                 match_type = "any"  # mixed/empty → permissive default
 
-        # 3) Resolve data_type and flatten strings accordingly
+        # 3) Resolve data_type and flatten
         if len(info["types"]) > 1:
             data_type = "mixed"
             strings = [{"value": it["value"], "data_type": it["data_type"]} for it in info["strings"]]
@@ -700,20 +691,19 @@ def _fuse_groups_by_base(rule_obj: dict) -> dict:
             strings = [it["value"] for it in info["strings"] if it.get("data_type", data_type) == data_type]
 
         fused_groups[base] = {
-            "match_type": match_type,  # 'all'/'any' or an int threshold
+            "match_type": match_type,  # 'all'/'any' or an int
             "data_type": data_type,
             "strings": strings
         }
 
-    # Return a new rule object with fused groups
     return {**rule_obj, "groups": fused_groups}
 
 
 def _ordered_group_names(groups_in: dict, conditions_in: list) -> list[str]:
     """
-    Order group names:
-    - first the ones referenced in conditions (for determinism in debugging),
-    - then any remaining ones alphabetically.
+    Order group names deterministically:
+    - first those referenced in conditions,
+    - then the rest, alphabetically.
     """
     seen = []
     seen_set = set()
@@ -723,8 +713,13 @@ def _ordered_group_names(groups_in: dict, conditions_in: list) -> list[str]:
     others = sorted([k for k in groups_in.keys() if k not in seen_set])
     return seen + others
 
-# ---------- Rule conversion (one rule from input -> one anonymized rule object) ----------
+
+# ---------- Rule conversion (input rule -> anonymized rule) ----------
 def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert one input rule (cleartext groups/conditions) into an anonymized rule
+    (opaque groups gN, signed obfuscated tokens, remapped conditions).
+    """
     rule_obj = _fuse_groups_by_base(rule_obj)
 
     groups_in: Dict[str, Any] = rule_obj.get("groups", {})
@@ -732,15 +727,15 @@ def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
 
     ordered_names = _ordered_group_names(groups_in, conditions_in)
 
-    # 1) recolectar los 'op' por grupo (por nombre y por base)
+    # Collect next-ops for sequences per group (by original name and base)
     seq_nextops_by_group = _collect_seq_nextops_by_group(conditions_in)
 
     name_map: Dict[str, str] = {}
     groups_out: Dict[str, Any] = {}
     sid_maps: Dict[str, Dict[str, str]] = {}
 
-    # meta por grupo base (para reconstrucción de secuencias)
-    meta_by_base = {}  # base -> dict(absorbed_from, dropped_sids, seg_len_map, kept_order, orig_name)
+    # Per-base metadata for sequence reconstruction after dropping segments
+    meta_by_base = {}  # base -> {absorbed_from, dropped_sids, seg_len_map, kept_order, orig_name}
 
     for idx, orig_name in enumerate(ordered_names, start=1):
         gobj = groups_in[orig_name]
@@ -768,7 +763,7 @@ def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
         else:
             groups_out[gid] = _process_group_simple(gobj)
 
-    # 2) Ajuste por absorción (-1) sobre las conditions originales
+    # Adjust original conditions for absorption (-1 byte in the corresponding gap)
     conditions_adj = copy.deepcopy(conditions_in)
 
     def _adjust_inplace(node: Dict[str, Any]):
@@ -789,7 +784,7 @@ def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
     for n in conditions_adj:
         _adjust_inplace(n)
 
-    # 3) RECONSTRUIR secuencias para cada grupo 'cadena' con drops (<7B) sumando gaps + longitudes dropeadas
+    # Rebuild sequences for each 'cadena' base after dropping <7B segments
     conditions_rebuilt = conditions_adj
     for base, meta in meta_by_base.items():
         if not meta["kept_order"]:
@@ -802,12 +797,10 @@ def _convert_rule(rule_obj: Dict[str, Any]) -> Dict[str, Any]:
             meta["seg_len_map"],
         )
 
-
-    # 4) Remapear condiciones (grupo y from/to) a gN y gN_segM FINAL
+    # Final remap: group names -> gN; sequence from/to -> gN_segM
     conditions_out = [_remap_condition_node(c, name_map, sid_maps) for c in conditions_rebuilt]
 
     return {"groups": groups_out, "conditions": conditions_out}
-
 
 
 # ---------- Main: load dict -> build anonymized payload -> POST to MB ----------
@@ -816,9 +809,14 @@ def generate_and_send_ruleset(dict_path: str = DICT_PATH, mb_url: str = MB_URL):
     """
     Load the default dictionary JSON and send the anonymized ruleset to the MB.
     Output payload shape (no rule names, no cleartext, no data_type):
-      { "rules": [ { "groups": {...}, "conditions": [...] }, ... ] }
+      {
+        "rules": [
+          { "groups": {...}, "conditions": [...] },
+          ...
+        ]
+      }
     """
-    # Load private RSA key once (for signing obfuscated tokens)
+    # Load private RSA key once (used to sign obfuscated tokens)
     global _PRIVATE_KEY
     _PRIVATE_KEY = load_private_key(os.path.join(current_dir, 'keys', 'rg_private_key.pem'))
 
@@ -826,7 +824,7 @@ def generate_and_send_ruleset(dict_path: str = DICT_PATH, mb_url: str = MB_URL):
     with open(dict_path, "r", encoding="utf-8") as f:
         input_dict = json.load(f)
 
-    # Convert each rule entry to anonymized form (drop rule names)
+    # Convert each rule (drop rule-name identifiers)
     rules_out: List[Dict[str, Any]] = []
     for _rule_name, rule_obj in input_dict.items():
         anon_rule = _convert_rule(rule_obj)
@@ -834,6 +832,7 @@ def generate_and_send_ruleset(dict_path: str = DICT_PATH, mb_url: str = MB_URL):
 
     payload = {"rules": rules_out}
     print(payload)
+
     # POST to MB
     try:
         print(f"[RG] Sending anonymized ruleset with {len(rules_out)} rules to MB: {mb_url}")
