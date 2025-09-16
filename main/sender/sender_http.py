@@ -29,6 +29,7 @@ from flask import Flask, request, jsonify
 import logging
 import os
 import requests
+from dotenv import load_dotenv 
 
 from sender_utils import (
     load_public_key,
@@ -41,15 +42,25 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # === Paths & constants ===
-current_dir = os.path.dirname(os.path.abspath(__file__))
+CURRENT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT  = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))   # carga .env de la raíz
 
-# RG public key (used to verify per-token signatures)
-public_key_path = os.path.abspath(os.path.join(current_dir, '..', 'shared', 'keys', 'rg_public_key.pem'))
-rg_public_key = load_public_key(public_key_path)
+def _abs(path: str) -> str:
+    """Convierte rutas relativas del .env a absolutas desde la raíz del proyecto."""
+    return path if os.path.isabs(path) else os.path.abspath(os.path.join(PROJECT_ROOT, path))
 
-# MB endpoint for Sender intermediates (new, with role in path)
-MB_INTERMEDIATE_URL = "http://localhost:9999/receive_intermediate/sender"
+RG_PUBLIC_KEY_PATH = _abs(os.environ.get(
+    "RG_PUBLIC_KEY_PATH",
+    "main/shared/keys/rg_public_key.pem"   # valor por defecto relativo a la raíz del repo
+))
+rg_public_key = load_public_key(RG_PUBLIC_KEY_PATH)
 
+# Endpoint del MB para devolver los 'intermediate' (configurable por .env)
+MB_INTERMEDIATE_URL = os.environ.get(
+    "MB_INTERMEDIATE_URL",
+    "http://127.0.0.1:9999/receive_intermediate/sender"
+)
 
 @app.route("/receive_rules", methods=["POST"])
 def receive_rules():

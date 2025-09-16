@@ -12,7 +12,11 @@ from flask import Flask, request, Response
 import requests
 import random
 import os
+
+import binascii
+import html
 from urllib.parse import quote_from_bytes
+from dotenv import load_dotenv
 
 
 # New: import the orchestrator helpers instead of direct sliding window
@@ -29,16 +33,58 @@ app = Flask(__name__)
 
 # === Certificate paths ===
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-CA_CERT_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "certs", "ca.cert.pem"))
-SENDER_CERT = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "certs", "sender.crt"))
-SENDER_KEY = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "ca", "private", "sender.key"))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env")) 
 
-# === URL of the receiver service ===
-RECEIVER_URL = "https://receiver.p2dpi.local:10443/"
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.abspath(os.path.join(PROJECT_ROOT, path))
 
+
+CA_CERT_PATH = _abs(os.environ.get("CA_CERT_PATH", "./ca/certs/ca.cert.pem"))
+SENDER_CERT  = _abs(os.environ.get("SENDER_CERT",  "./ca/certs/sender.crt"))
+SENDER_KEY   = _abs(os.environ.get("SENDER_KEY",   "./ca/private/sender.key"))
+RECEIVER_URL = os.environ.get("RECEIVER_URL", "https://127.0.0.1:10443/")
+MB_URL       = os.environ.get("MB_URL",       "http://127.0.0.1:9999/receive_tokens")
 # Debug flags (optional)
 DEBUG_PRINT_TOKENS = True
 DEBUG_PRINT_ENCRYPTED = False
+
+
+def bytes_to_display(b: bytes, max_len: int = 2048) -> str:
+    """
+    Produce a readable preview for arbitrary bytes:
+    - ASCII-printable characters shown
+    - non-printables escaped
+    - also include a hex-dump line for short content
+    Truncates at max_len bytes for safety.
+    """
+    if not isinstance(b, (bytes, bytearray)):
+        b = bytes(b)
+
+    truncated = False
+    if len(b) > max_len:
+        b = b[:max_len]
+        truncated = True
+
+    # Try to produce a mostly-human readable ascii with escapes
+    parts = []
+    for c in b:
+        if 32 <= c <= 126:  # printable ASCII
+            parts.append(chr(c))
+        elif c in (9, 10, 13):  # tab, lf, cr -> keep as is for readability
+            parts.append(chr(c))
+        else:
+            parts.append(f"\\x{c:02x}")
+
+    ascii_view = "".join(parts)
+    # Hex view (grouped)
+    hex_view = b.hex()
+    # make grouped hex (pairs with spaces)
+    hex_grouped = " ".join(hex_view[i:i+2] for i in range(0, len(hex_view), 2))
+
+    trailer = ("\n\n[TRUNCATED]" if truncated else "")
+    return f"--- ASCII/escaped view ---\n{ascii_view}\n\n--- Hex (bytes) ---\n{hex_grouped}{trailer}"
+
 
 # ---------------------------
 # Scenario menu configuration (expanded)
@@ -233,7 +279,7 @@ def _scenario_pdf_rule1() -> bytes:
         b"This looks like a PDF but has no version header\n"
     )
 
-def _scenario_pdf_creationdate() -> bytes:
+def _scenario_pdf_date() -> bytes:
     """PDF with CreationDate in Info dict."""
     return (
         b"From: attacker@corp.local\r\n"
@@ -342,8 +388,8 @@ SCENARIOS = {
     "chinachopper_php": _scenario_chinachopper_php,
 
     # PDF variants
-    "pdf_rule1": _scenario_pdf_rule1,
-    "pdf_creationdate": _scenario_pdf_creationdate,
+    "pdf_version": _scenario_pdf_rule1,
+    "pdf_date": _scenario_pdf_date,
     "pdf_possible_exploit": _scenario_pdf_possible_exploit,
     "pdf_js_wrong_version": _scenario_pdf_js_wrong_version,
     "pdf_xdp_embedded": _scenario_pdf_xdp_embedded,
@@ -402,8 +448,6 @@ def proxy():
         if DEBUG_PRINT_TOKENS:
             for i, tok in enumerate(tokens):
                 try_ascii = tok.decode("ascii", errors="ignore")
-                print(f"[TOK{i:04d}] {tok.hex()}  |  ASCII: {try_ascii!r}")
-
         # 5) Encrypt tokens with current counter
         kSR = load_ksr_from_file()              # shared S↔R secret
         counter = random.randint(0, 2**32 - 1)  # nonce/counter for PRF
@@ -480,19 +524,19 @@ def proxy():
 
 
 # ---------------------------
-# NEW: simple HTML menu (GET)
+# simple HTML menu (GET)
 # ---------------------------
 @app.route("/test_menu", methods=["GET"])
 def test_menu():
     """
     Render a small HTML form to choose which test 'fake email' to send.
-    It submits to /send_test_data with ?scenario=... (GET) for simplicity.
+    Now includes a preview area that fetches /scenario_preview and an interactive send flow.
     """
     options_html = "\n".join(
         f'<option value="{k}" {"selected" if k == DEFAULT_SCENARIO else ""}>{k}</option>'
         for k in SCENARIOS.keys()
     )
-    html = f"""
+    html_page = f"""
     <!doctype html>
     <html>
       <head>
@@ -500,34 +544,101 @@ def test_menu():
         <title>P2DPI Sender — Test Menu</title>
         <style>
           body {{ font-family: system-ui, sans-serif; padding: 24px; }}
-          .card {{ max-width: 640px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 12px; }}
+          .card {{ max-width: 880px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 12px; }}
           label, select, button {{ font-size: 16px; }}
           select {{ padding: 6px 8px; }}
           button {{ padding: 8px 12px; cursor: pointer; }}
           .row {{ display: flex; gap: 12px; align-items: center; }}
+          pre#preview {{ background:#111; color:#e6e6e6; padding:12px; border-radius:8px; max-height:320px; overflow:auto; white-space:pre-wrap; }}
+          #result {{ margin-top:12px; padding:8px; border-radius:8px; background:#f6f6f6; }}
         </style>
       </head>
       <body>
         <div class="card">
           <h2>Choose a test message to send</h2>
-          <form method="GET" action="/send_test_data">
+          <form id="testForm" method="GET" action="/send_test_data">
             <div class="row">
               <label for="scenario">Scenario:</label>
               <select id="scenario" name="scenario">
                 {options_html}
               </select>
-              <button type="submit">Send</button>
+              <button id="sendBtn" type="submit">Send</button>
+              <button id="refreshPreview" type="button">Refresh preview</button>
             </div>
             <p style="color:#666;margin-top:12px">
               The selected scenario will be URL-encoded into the request body and processed normally by the Sender → MB → Receiver pipeline.
             </p>
+
+            <h3>Scenario preview (read-only)</h3>
+            <pre id="preview">Loading preview...</pre>
+
+            <div id="result" aria-live="polite"></div>
           </form>
         </div>
+
+        <script>
+          async function loadPreview(scenario) {{
+            const res = await fetch('/scenario_preview?scenario=' + encodeURIComponent(scenario));
+            const text = await res.text();
+            document.getElementById('preview').textContent = text;
+            return text;
+          }}
+
+          document.addEventListener('DOMContentLoaded', async () => {{
+            const select = document.getElementById('scenario');
+            // load initial preview
+            await loadPreview(select.value);
+
+            select.addEventListener('change', async () => {{
+              await loadPreview(select.value);
+            }});
+
+            document.getElementById('refreshPreview').addEventListener('click', async (ev) => {{
+              ev.preventDefault();
+              await loadPreview(select.value);
+            }});
+
+            document.getElementById('testForm').addEventListener('submit', async (ev) => {{
+              ev.preventDefault();
+              const scenario = select.value;
+              const previewText = document.getElementById('preview').textContent || '';
+
+              // Ask user to confirm (the preview is visible on the page)
+              const ok = window.confirm("Send scenario '" + scenario + "' to the Sender?\\nPreview is shown below. Press OK to send.");
+              if (!ok) {{
+                document.getElementById('result').textContent = 'Send cancelled by user.';
+                return;
+              }}
+
+              // Call the backend endpoint (GET for simplicity; original code uses GET)
+              document.getElementById('result').textContent = 'Sending...';
+              try {{
+                const resp = await fetch('/send_test_data?scenario=' + encodeURIComponent(scenario), {{ method: 'GET' }});
+                const text = await resp.text();
+                document.getElementById('result').textContent = text;
+              }} catch (e) {{
+                document.getElementById('result').textContent = 'Error sending: ' + String(e);
+              }}
+            }});
+          }});
+        </script>
       </body>
     </html>
     """
-    return Response(html, mimetype="text/html")
+    return Response(html_page, mimetype="text/html")
 
+
+@app.route("/scenario_preview", methods=["GET"])
+def scenario_preview():
+    """
+    Return a text/plain preview of the chosen scenario payload.
+    Query param: ?scenario=<key>
+    """
+    scenario = request.args.get("scenario") or DEFAULT_SCENARIO
+    payload = _build_fake_email(scenario)
+    preview = bytes_to_display(payload, max_len=4096)
+    # Devuelve texto plano (fácil de mostrar en un <pre>)
+    return Response(preview, mimetype="text/plain")
 
 # ---------------------------------------
 # UPDATED: local helper to trigger a POST
@@ -536,11 +647,16 @@ def test_menu():
 def trigger_test_client_request():
     """
     Local helper endpoint that crafts a form-encoded POST to the public Sender endpoint (/).
-    It now accepts a 'scenario' (via GET or POST) to choose which fake email body to include.
+    It accepts a 'scenario' and prints the preview on the server before sending.
+    Returns the response text and embeds the preview for convenience.
     """
-    # Preferred source: GET param (from the test_menu form)
     scenario = request.args.get("scenario") or request.form.get("scenario") or DEFAULT_SCENARIO
     fake_email = _build_fake_email(scenario)
+
+    # Build a readable preview server-side and print it
+    preview = bytes_to_display(fake_email, max_len=8192)
+    print(f"=== /send_test_data: selected scenario='{scenario}' ===")
+    print(preview)   # esto se ve en la consola del servidor inmediatamente
 
     # Build application/x-www-form-urlencoded payload, keeping email body as bytes safely URL-encoded
     data_bytes = (
@@ -555,12 +671,13 @@ def trigger_test_client_request():
         response = requests.post(
             "https://sender.p2dpi.local:8443/",
             data=data_bytes,
-            verify=CA_CERT_PATH
+            verify=CA_CERT_PATH,
+            timeout=10
         )
-        return f"[LOCAL CLIENT] scenario={scenario} • POST response: {response.text}", response.status_code
+        return (f"[LOCAL CLIENT] scenario={scenario} • POST response: {response.text}\n\n"), response.status_code
     except Exception as e:
-        return f"[LOCAL CLIENT] Error (scenario={scenario}): {str(e)}", 500
-
+        return (f"[LOCAL CLIENT] Error (scenario={scenario}): {str(e)}\n\n"
+                f"--- Server-side preview ---\n{preview}"), 500
 
 if __name__ == "__main__":
     app.run(

@@ -117,14 +117,6 @@ def handle_sender_request():
         encrypted_tokens = encrypt_tokens(tokens_bytes, kSR, counter_int, prf, h_fixed_hex)
         ENCRYPTED_TOKENS_RECEIVED = [t.hex() for t in encrypted_tokens]
 
-        print("[Receiver HTTPS] Encrypted tokens received, calculate in Receiver:")
-        for t in ENCRYPTED_TOKENS_RECEIVED:
-            print(t)
-            
-        print("[Receiver HTTPS] Stored tokens from MB:")
-        for t in STORED_ENCRYPTED_TOKENS:
-            print(t)
-
         # Check if reference tokens exist
         if not STORED_ENCRYPTED_TOKENS or STORED_COUNTER is None:
             return jsonify({"error": "No reference tokens available"}), 400
