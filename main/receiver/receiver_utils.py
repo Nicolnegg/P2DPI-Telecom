@@ -10,6 +10,16 @@ import os
 import base64
 import requests
 import hashlib
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path, env_str
+
+RECEIVER_KEYS_DIR = env_path("RECEIVER_KEYS_DIR", "./main/receiver/keys")
 
 # Load the PRF shared library (prf.so) and define argument and return types for FKH_hex
 # Returns the loaded CDLL object
@@ -74,10 +84,8 @@ def load_ksr():
     Raises:
         ValueError: If either key file is missing.
     """
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.join(current_dir, 'keys')
-    ksr_path = os.path.join(base_dir, "shared_ksr.key")
-    key_path = os.path.join(base_dir, "key_for_ksr.key")
+    ksr_path = os.path.join(RECEIVER_KEYS_DIR, "shared_ksr.key")
+    key_path = os.path.join(RECEIVER_KEYS_DIR, "key_for_ksr.key")
 
     if not os.path.exists(ksr_path) or not os.path.exists(key_path):
         raise ValueError("Missing kSR or encryption key")
@@ -181,15 +189,15 @@ def encrypt_tokens(tokens: list, kSR_hex: str, counter: int, prf, h_fixed_hex: s
 
     return encrypted_tokens
 
+MB_ALERT_URL = env_str("MB_ALERT_URL", "http://127.0.0.1:9999/validation")
+
+
 def send_alert_to_middlebox(alert_data):
     """
     Sends alert JSON to Middlebox indicating a possible attack.
     """
     try:
-        mb_alert_url = "http://localhost:9999/validation"
-        response = requests.post(mb_alert_url, json=alert_data, timeout=3)
+        response = requests.post(MB_ALERT_URL, json=alert_data, timeout=3)
         print(f"[Receiver HTTPS] Alert sent to Middlebox: {response.status_code}")
     except Exception as e:
         print(f"[Receiver HTTPS] Failed to send alert to Middlebox: {e}")
-
-

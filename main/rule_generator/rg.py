@@ -22,10 +22,18 @@ import os
 import requests
 import re
 import copy
+import sys
+from pathlib import Path
 
 from collections import defaultdict
 from crypto_utils import load_private_key, sign_data
 from rg_utils import emit_tokens_for_pattern, emit_tokens_for_hex_literal, normalize_view_text
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path, env_str
 
 
 # --- Debug printing (ASCII preview of tokens) ---
@@ -89,8 +97,8 @@ with open(h_path, 'r') as f:
     h_fixed_hex = f.read().strip()
 
 # --- Paths ---
-DICT_PATH = os.path.join(current_dir, "dictionary.json")   # input (YARA → default dict)
-MB_URL    = "http://localhost:9999/upload_rules"           # MB endpoint for rules
+DICT_PATH = env_path("RG_DICTIONARY_PATH", "./main/rule_generator/dictionary.json")
+MB_URL = env_str("MB_RULE_UPLOAD_URL", "http://127.0.0.1:9999/upload_rules")
 
 
 # ---------- PRF wrapper: obfuscate a single 8-byte token ----------

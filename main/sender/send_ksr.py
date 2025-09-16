@@ -2,6 +2,13 @@ import requests
 import secrets
 import os
 import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path, env_str
 
 # === Configuration === Run before to sned the data
 
@@ -10,21 +17,17 @@ ksr = secrets.token_hex(16)
 print("[Sender] Generated kSR:", ksr)
 
 # Receiver URL (must match TLS CN/SAN)
-url = "https://receiver.p2dpi.local:10443/receive_ksr"
+url = env_str("RECEIVER_KSR_URL", "https://127.0.0.1:10443/receive_ksr")
 
 # === Resolve paths ===
 
-# Base directory of this script
-base_dir = os.path.dirname(os.path.abspath(__file__))
-
-# CA paths (relative to project structure)
-ca_dir = os.path.abspath(os.path.join(base_dir, "..", "..", "ca"))
-cert_path = os.path.join(ca_dir, "certs", "sender.crt")
-key_path = os.path.join(ca_dir, "private", "sender.key")
-ca_cert_path = os.path.join(ca_dir, "certs", "ca.cert.pem")
+# Resolve certificate paths via environment configuration
+cert_path = env_path("SENDER_CERT", "./ca/certs/sender.crt")
+key_path = env_path("SENDER_KEY", "./ca/private/sender.key")
+ca_cert_path = env_path("CA_CERT_PATH", "./ca/certs/ca.cert.pem")
 
 # Output directory for storing kSR locally
-keys_dir = os.path.join(base_dir, "keys")
+keys_dir = env_path("SENDER_KEYS_DIR", "./main/sender/keys")
 ksr_file_path = os.path.join(keys_dir, "shared_ksr.key")
 
 # Ensure the keys directory exists

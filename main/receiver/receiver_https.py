@@ -7,15 +7,23 @@ from receiver_utils import encrypt_tokens, load_ksr, load_prf_library, load_h_fi
 
 import os
 import re
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path
 
 
 app = Flask("receiver_https")
 
 # Path constants for encrypted kSR and encryption key storage
-current_dir = os.path.dirname(os.path.abspath(__file__))
-KSR_ENCRYPTED_PATH = os.path.abspath(os.path.join(current_dir, 'keys', 'shared_ksr.key'))
-KSR_ENCRYPTION_KEY_PATH = os.path.abspath(os.path.join(current_dir, 'keys', 'key_for_ksr.key'))
-CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
+KEYS_DIR = env_path("RECEIVER_KEYS_DIR", "./main/receiver/keys")
+KSR_ENCRYPTED_PATH = os.path.join(KEYS_DIR, 'shared_ksr.key')
+KSR_ENCRYPTION_KEY_PATH = os.path.join(KEYS_DIR, 'key_for_ksr.key')
+CA_CERT_PATH = env_path("CA_CERT_PATH", "./ca/certs/ca.cert.pem")
 
 STORED_ENCRYPTED_TOKENS = []  
 STORED_COUNTER = None

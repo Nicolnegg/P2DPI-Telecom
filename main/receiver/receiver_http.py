@@ -36,6 +36,8 @@ from receiver_utils import (
 )
 import requests
 import os
+import sys
+from pathlib import Path
 
 BUFFER_SIZE = 200
 
@@ -47,11 +49,19 @@ prf = load_prf_library()        # must expose EC_POINT_exp_hex
 h_fixed_hex = load_h_fixed()    # not used directly here, but loaded as in your original code
 
 # Load RG public key
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-public_key_path = os.path.abspath(
-    os.path.join(BASE_DIR, '..', 'shared', 'keys', 'rg_public_key.pem')
-)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_int, env_path, env_str
+
+public_key_path = env_path("RG_PUBLIC_KEY_PATH", "./main/shared/keys/rg_public_key.pem")
 rg_public_key = load_public_key(public_key_path)
+MB_RECEIVER_INTERMEDIATE_URL = env_str(
+    "MB_RECEIVER_INTERMEDIATE_URL",
+    "http://127.0.0.1:9999/receive_intermediate/receiver",
+)
+APP_PORT = env_int("RECEIVER_HTTP_PORT", 10000)
 
 
 def compute_intermediate_rules_hex(rules_hex, kSR_hex):
@@ -163,10 +173,9 @@ def receive_rules():
         intermediate.append({"seq": int(seq), "Ii": Ii})
 
     # Send to Middlebox under the receiver role endpoint
-    mb_url = "http://localhost:9999/receive_intermediate/receiver"
     try:
         response = requests.post(
-            mb_url,
+            MB_RECEIVER_INTERMEDIATE_URL,
             json={"batch_id": batch_id, "intermediate": intermediate},
             timeout=5
         )
@@ -194,4 +203,4 @@ def receive_rules():
 
 if __name__ == "__main__":
     # Plain HTTP service
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=APP_PORT)

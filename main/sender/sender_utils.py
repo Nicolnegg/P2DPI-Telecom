@@ -15,6 +15,14 @@ import base64
 import logging
 import hashlib
 import re
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path
 
 BUFFER_SIZE = 200
 TOKEN_WINDOW_SIZE = 8
@@ -47,7 +55,8 @@ with open(h_path, 'r') as f:
     h_fixed_hex = f.read().strip()
 
 # === Path to stored kSR key file ===
-ksr_path = os.path.abspath(os.path.join(current_dir, "keys", "shared_ksr.key"))
+keys_dir = env_path("SENDER_KEYS_DIR", "./main/sender/keys")
+ksr_path = os.path.join(keys_dir, "shared_ksr.key")
 
 def extract_tokens_sliding_window(payload: bytes, window_size=TOKEN_WINDOW_SIZE):
     """

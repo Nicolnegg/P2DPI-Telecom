@@ -1,11 +1,19 @@
 import os
 import requests
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path, env_str
 
 # Generate 128-bit (16 bytes) key 
 kmb = os.urandom(16)
 
 # Define output directories
-rg_dir = os.path.join("middlebox", "rule_generator", "keys")
+rg_dir = env_path("RG_KEYS_DIR", "./main/rule_generator/keys")
 
 # Create directories if not exist 
 os.makedirs(rg_dir, exist_ok=True)
@@ -24,7 +32,7 @@ print(" -", kmb_path)
 kmb_hex = kmb.hex()
 
 # URL of MB API (change hostname/port if needed)
-mb_api_url = "http://localhost:9999/receive_kmb"
+mb_api_url = env_str("MB_RECEIVE_KMB_URL", "http://127.0.0.1:9999/receive_kmb")
 
 try:
     response = requests.post(mb_api_url, json={"kmb": kmb_hex})

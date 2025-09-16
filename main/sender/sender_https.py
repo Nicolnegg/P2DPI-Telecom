@@ -12,11 +12,18 @@ from flask import Flask, request, Response
 import requests
 import random
 import os
+import sys
 
 import binascii
 import html
+from pathlib import Path
 from urllib.parse import quote_from_bytes
-from dotenv import load_dotenv
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_path, env_str
 
 
 # New: import the orchestrator helpers instead of direct sliding window
@@ -32,19 +39,12 @@ from sender_utils import (
 app = Flask(__name__)
 
 # === Certificate paths ===
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
-load_dotenv(os.path.join(PROJECT_ROOT, ".env")) 
-
-def _abs(path: str) -> str:
-    return path if os.path.isabs(path) else os.path.abspath(os.path.join(PROJECT_ROOT, path))
-
-
-CA_CERT_PATH = _abs(os.environ.get("CA_CERT_PATH", "./ca/certs/ca.cert.pem"))
-SENDER_CERT  = _abs(os.environ.get("SENDER_CERT",  "./ca/certs/sender.crt"))
-SENDER_KEY   = _abs(os.environ.get("SENDER_KEY",   "./ca/private/sender.key"))
-RECEIVER_URL = os.environ.get("RECEIVER_URL", "https://127.0.0.1:10443/")
-MB_URL       = os.environ.get("MB_URL",       "http://127.0.0.1:9999/receive_tokens")
+CA_CERT_PATH = env_path("CA_CERT_PATH", "./ca/certs/ca.cert.pem")
+SENDER_CERT = env_path("SENDER_CERT", "./ca/certs/sender.crt")
+SENDER_KEY = env_path("SENDER_KEY", "./ca/private/sender.key")
+RECEIVER_URL = env_str("RECEIVER_URL", "https://127.0.0.1:10443/")
+MB_URL = env_str("MB_URL", "http://127.0.0.1:9999/receive_tokens")
+SENDER_PUBLIC_URL = env_str("SENDER_PUBLIC_URL", "https://127.0.0.1:8443/")
 # Debug flags (optional)
 DEBUG_PRINT_TOKENS = True
 DEBUG_PRINT_ENCRYPTED = False
@@ -462,10 +462,9 @@ def proxy():
         tokens_hex = [t.hex() for t in encrypted_tokens]
         counter_hex = counter.to_bytes(4, "big").hex()
 
-        mb_url = "http://localhost:9999/receive_tokens"
         try:
             mb_response = requests.post(
-                mb_url,
+                MB_URL,
                 json={"encrypted_tokens": tokens_hex, "c": counter_hex},
                 timeout= 120
             )
@@ -669,7 +668,7 @@ def trigger_test_client_request():
 
     try:
         response = requests.post(
-            "https://sender.p2dpi.local:8443/",
+            SENDER_PUBLIC_URL,
             data=data_bytes,
             verify=CA_CERT_PATH,
             timeout=10

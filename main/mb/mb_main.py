@@ -14,6 +14,8 @@ import uuid
 import requests
 import logging
 from ctypes import c_char_p, create_string_buffer
+import sys
+from pathlib import Path
 
 from mb_utils import (
     load_prf, load_h_fixed, load_kmb_from_file,
@@ -26,6 +28,13 @@ from mb_utils import (
 
 app = Flask(__name__)
 
+# Ensure shared config helpers are importable when running as a script.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_int, env_path, env_str
+
 # Keep logs quiet by default (warnings and errors only)
 app.logger.setLevel(logging.WARNING)
 
@@ -34,9 +43,12 @@ app.logger.setLevel(logging.WARNING)
 # -------------------------
 
 # Receiver endpoints (adjust to your deployment)
-RECEIVER_URL = "https://receiver.p2dpi.local:10443/store_tokens"
-RECEIVER_DELETE_URL = "https://receiver.p2dpi.local:10443/delete_tokens"
-CA_CERT_PATH = os.path.abspath(os.path.join('receiver', '..', 'ca', 'certs', 'ca.cert.pem'))
+RECEIVER_URL = env_str("RECEIVER_STORE_URL", "https://127.0.0.1:10443/store_tokens")
+RECEIVER_DELETE_URL = env_str("RECEIVER_DELETE_URL", "https://127.0.0.1:10443/delete_tokens")
+CA_CERT_PATH = env_path("CA_CERT_PATH", "./ca/certs/ca.cert.pem")
+SENDER_RULES_URL = env_str("SENDER_RULES_URL", "http://127.0.0.1:11000/receive_rules")
+RECEIVER_RULES_URL = env_str("RECEIVER_RULES_URL", "http://127.0.0.1:10000/receive_rules")
+APP_PORT = env_int("MB_PORT", 9999)
 
 # -------------------------
 # Globals (runtime state)
@@ -117,7 +129,7 @@ def upload_rules():
 
     # Forward to Receiver (R)
     try:
-        r_response = requests.post("http://localhost:10000/receive_rules", json=fanout_payload, timeout=5)
+        r_response = requests.post(RECEIVER_RULES_URL, json=fanout_payload, timeout=5)
         if r_response.status_code != 200:
             app.logger.warning("[MB → R] /receive_rules returned %s", r_response.status_code)
     except Exception as e:
@@ -125,7 +137,7 @@ def upload_rules():
 
     # Forward to Sender (S)
     try:
-        s_response = requests.post("http://localhost:11000/receive_rules", json=fanout_payload, timeout=5)
+        s_response = requests.post(SENDER_RULES_URL, json=fanout_payload, timeout=5)
         if s_response.status_code != 200:
             app.logger.warning("[MB → S] /receive_rules returned %s", s_response.status_code)
     except Exception as e:
@@ -373,4 +385,4 @@ if __name__ == "__main__":
     if h_fixed:
         app.logger.warning("[MB] Fixed point h loaded")
 
-    app.run(host="0.0.0.0", port=9999)
+    app.run(host="0.0.0.0", port=APP_PORT)

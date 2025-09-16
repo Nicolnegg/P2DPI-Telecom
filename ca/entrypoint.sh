@@ -21,7 +21,7 @@ openssl req -x509 -new -nodes -key private/ca.key.pem -sha256 -days 3650 \
 # === Helper function to generate OpenSSL config with SAN (SubjectAltName) ===
 create_openssl_conf() {
   local CN="$1"
-  local SAN="$2"
+  local SAN_LIST="$2"
   local OUTFILE="$3"
 
   cat > "$OUTFILE" <<EOF
@@ -44,8 +44,31 @@ CN = $CN
 subjectAltName = @alt_names
 
 [alt_names]
-DNS.1 = $SAN
 EOF
+
+  IFS=',' read -ra SAN_ENTRIES <<< "$SAN_LIST"
+  local dns_idx=1
+  local ip_idx=1
+  for san in "${SAN_ENTRIES[@]}"; do
+    san=${san// /}
+    if [[ -z "$san" ]]; then
+      continue
+    fi
+    local value
+    if [[ "$san" == IP:* ]]; then
+      value=${san#IP:}
+      echo "IP.$ip_idx = $value" >> "$OUTFILE"
+      ((ip_idx++))
+    else
+      if [[ "$san" == DNS:* ]]; then
+        value=${san#DNS:}
+      else
+        value=$san
+      fi
+      echo "DNS.$dns_idx = $value" >> "$OUTFILE"
+      ((dns_idx++))
+    fi
+  done
 }
 
 # === Function to generate a certificate for any role (Sender, Receiver, etc.) ===
@@ -67,10 +90,10 @@ generate_cert() {
 }
 
 # === Generate certificates for each node ===
-generate_cert "receiver" "receiver.p2dpi.local" "receiver.p2dpi.local"
-generate_cert "sender" "sender.p2dpi.local" "sender.p2dpi.local"
-generate_cert "client" "client.p2dpi.local" "client.p2dpi.local"
-generate_cert "server" "server.p2dpi.local" "server.p2dpi.local"
+generate_cert "receiver" "receiver.p2dpi.local" "DNS:receiver.p2dpi.local,DNS:localhost,IP:127.0.0.1,IP:192.168.1.55"
+generate_cert "sender" "sender.p2dpi.local" "DNS:sender.p2dpi.local,DNS:localhost,IP:127.0.0.1,IP:192.168.1.55"
+generate_cert "client" "client.p2dpi.local" "DNS:client.p2dpi.local"
+generate_cert "server" "server.p2dpi.local" "DNS:server.p2dpi.local"
 
 echo "[✓] All certificates (CA, Sender, Receiver, Client, Server) generated successfully."
 

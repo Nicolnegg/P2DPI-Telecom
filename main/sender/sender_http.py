@@ -29,7 +29,8 @@ from flask import Flask, request, jsonify
 import logging
 import os
 import requests
-from dotenv import load_dotenv 
+import sys
+from pathlib import Path
 
 from sender_utils import (
     load_public_key,
@@ -38,29 +39,26 @@ from sender_utils import (
     compute_intermediate_rules_hex,  # takes a list of Ri-hex and returns list of Ii-hex in the same order
 )
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
+from main.shared.config import env_int, env_path, env_str
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # === Paths & constants ===
-CURRENT_DIR   = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT  = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))   # carga .env de la raíz
+public_key_path = env_path("RG_PUBLIC_KEY_PATH", "./main/shared/keys/rg_public_key.pem")
+rg_public_key = load_public_key(public_key_path)
 
-def _abs(path: str) -> str:
-    """Convierte rutas relativas del .env a absolutas desde la raíz del proyecto."""
-    return path if os.path.isabs(path) else os.path.abspath(os.path.join(PROJECT_ROOT, path))
-
-RG_PUBLIC_KEY_PATH = _abs(os.environ.get(
-    "RG_PUBLIC_KEY_PATH",
-    "main/shared/keys/rg_public_key.pem"   # valor por defecto relativo a la raíz del repo
-))
-rg_public_key = load_public_key(RG_PUBLIC_KEY_PATH)
-
-# Endpoint del MB para devolver los 'intermediate' (configurable por .env)
-MB_INTERMEDIATE_URL = os.environ.get(
+# MB endpoint for Sender intermediates (new, with role in path)
+MB_INTERMEDIATE_URL = env_str(
     "MB_INTERMEDIATE_URL",
-    "http://127.0.0.1:9999/receive_intermediate/sender"
+    "http://127.0.0.1:9999/receive_intermediate/sender",
 )
+APP_PORT = env_int("SENDER_HTTP_PORT", 11000)
+
 
 @app.route("/receive_rules", methods=["POST"])
 def receive_rules():
@@ -152,4 +150,4 @@ def receive_rules():
 
 if __name__ == "__main__":
     # This service is plain HTTP (not the HTTPS traffic proxy).
-    app.run(port=11000)
+    app.run(port=APP_PORT)
