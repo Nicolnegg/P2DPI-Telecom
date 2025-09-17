@@ -111,7 +111,16 @@ This mapping preserves the detection intent while generating deterministic token
 3. Inspect `/receive_tokens` responses on the MB: `status: alert` returns HTTP 403 to the client and notifies Receiver HTTPS to delete stored tokens; `status: ok` allows forwarding.
 4. Review Receiver logs to confirm token validation and payload reconstruction.
 
-## 8. Limitations
+## 8. Expected Results
+Two outcomes appear when you exercise the sample scenarios:
+- **Clean traffic** (e.g., `clean_simple_email`, `clean_form_login`, `html_generic`, `pdf_magic_header`, `zip_magic_header`) flows end to end. The Sender confirms delivery and the MB reports `status: ok`.
+- **Malicious detections** (web shells such as `chinachopper_aspx`, PDF exploits, maldoc payloads, and other non-clean scenarios) are blocked. The Sender receives an HTTP 403 and the MB logs `status: alert`.
+
+![Allowed scenario screenshot](notattack.png)
+
+![Blocked scenario screenshot](attack_blocked.png)
+
+## 9. Limitations
 - PCRE-heavy YARA rules remain unsupported.
 - The fixed 8-byte window requires sequence conditions for signatures spanning longer contiguous bytes.
 - Flask apps run in development mode; production deployments should use gunicorn/uWSGI and secure key storage.
