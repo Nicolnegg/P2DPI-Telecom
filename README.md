@@ -16,18 +16,22 @@ P2DPI-Telecom implements the protocol described in `article.pdf`, adapting the p
    pip install -r requirements.txt
    ```
 2. **Configure `.env`.** Adjust all endpoints and certificate paths. `SENDER_PUBLIC_URL` and the `RECEIVER_*` URLs must reference hostnames/IPs present in the TLS certificates.
+   _Note: if you do not need to change these values you can skip this step._
 3. **Regenerate certificates.** `ca/entrypoint.sh` wipes prior material and issues a fresh CA plus Sender/Receiver/Client/Server certificates, each with multi-SAN support (`sender.p2dpi.local`, `localhost`, `127.0.0.1`, `192.168.1.55`).
    ```bash
    cd ca
    bash entrypoint.sh
    cd -
    ```
+   _Note: once the issuance finishes you can leave `entrypoint.sh` running or exit with `Ctrl+C`; the certificates are already generated._
 4. **Redistribute PRF secrets.**
+   Start `main/receiver/receiver_http.py`, `main/sender/sender_http.py`, and `main/mb/mb_main.py` before running these scripts so the keys reach their destinations.
    ```bash
    python main/rule_generator/generate_kmb.py      # Rule Generator → Middlebox (kMB)
    python main/sender/send_ksr.py                  # Sender → Receiver (kSR)
    ```
 5. **Launch each service (separate shells).**
+   Stop any previously running instance (`Ctrl+C`) to avoid conflicts and launch each service fresh.
    ```bash
    python main/mb/mb_main.py
    python main/sender/sender_http.py
@@ -39,7 +43,7 @@ P2DPI-Telecom implements the protocol described in `article.pdf`, adapting the p
    ```bash
    python main/rule_generator/rg.py
    ```
-7. **Exercise scenarios.** Visit `https://<sender-host>:8443/test_menu`, accept the self-signed cert, and send the sample payloads to observe Middlebox verdicts.
+7. **Exercise scenarios.** Visit `https://<sender-host>:8443/test_menu`, accept the self-signed cert, and send the sample payloads to observe Middlebox verdicts. For local tests you can point your browser to `https://127.0.0.1:8443/test_menu` as an example sender host.
 
 ## 3. Architecture Summary
 - **Sender HTTPS** normalises payload bytes, emits 8-byte sliding plus canonical tokens, encrypts them with kSR, posts them to the MB, and forwards the original request to Receiver HTTPS when allowed.
